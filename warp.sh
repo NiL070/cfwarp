@@ -3,11 +3,11 @@
 # https://github.com/P3TERX/warp.sh
 # Description: Cloudflare WARP Installer
 # System Required: Debian, Ubuntu, Fedora, CentOS, Oracle Linux, Arch Linux
-# Version: beta39
+# Version: 1.0.40_Final
 #
 # MIT License
 #
-# Copyright (c) 2021-2022 P3TERX <https://p3terx.com>
+# Copyright (c) 2021-2024 P3TERX <https://p3terx.com>
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -28,7 +28,7 @@
 # SOFTWARE.
 #
 
-shVersion='beta39'
+shVersion='1.0.40_Final'
 
 FontColor_Red="\033[31m"
 FontColor_Red_Bold="\033[1;31m"
@@ -83,8 +83,12 @@ WGCF_ProfilePath="${WGCF_ProfileDir}/${WGCF_Profile}"
 WireGuard_Interface='wgcf'
 WireGuard_ConfPath="/etc/wireguard/${WireGuard_Interface}.conf"
 
-WireGuard_Interface_DNS_IPv4='1.1.1.1,1.0.0.1'
-WireGuard_Interface_DNS_IPv6='2606:4700:4700::1111,2606:4700:4700::1001'
+WG_SYSTEMD_DROPIN_DIR="/etc/systemd/system/wg-quick@${WireGuard_Interface}.service.d"
+WG_SYSTEMD_IPV4_ONLY_DROPIN="${WG_SYSTEMD_DROPIN_DIR}/10-warp-ipv4-only.conf"
+WG_IPV4_ONLY_HELPER="/usr/local/bin/warp-wgcf-ipv4-only"
+
+WireGuard_Interface_DNS_IPv4='8.8.8.8,8.8.4.4'
+WireGuard_Interface_DNS_IPv6='2001:4860:4860::8888,2001:4860:4860::8844'
 WireGuard_Interface_DNS_46="${WireGuard_Interface_DNS_IPv4},${WireGuard_Interface_DNS_IPv6}"
 WireGuard_Interface_DNS_64="${WireGuard_Interface_DNS_IPv6},${WireGuard_Interface_DNS_IPv4}"
 WireGuard_Interface_Rule_table='51888'
@@ -153,7 +157,7 @@ Install_Requirements_Debian() {
 Install_WARP_Client_Debian() {
     if [[ ${SysInfo_OS_Name_lowercase} = ubuntu ]]; then
         case ${SysInfo_OS_CodeName} in
-        bionic | focal | jammy | noble) ;;
+        bionic | focal | jammy) ;;
         *)
             log ERROR "This operating system is not supported."
             exit 1
@@ -161,7 +165,7 @@ Install_WARP_Client_Debian() {
         esac
     elif [[ ${SysInfo_OS_Name_lowercase} = debian ]]; then
         case ${SysInfo_OS_CodeName} in
-        buster | bullseye | bookworm | trixie) ;;
+        bookworm | buster | bullseye) ;;
         *)
             log ERROR "This operating system is not supported."
             exit 1
@@ -304,7 +308,7 @@ Print_Delimiter() {
 }
 
 Install_wgcf() {
-    curl -fsSL https://raw.githubusercontent.com/NevermoreSSH/script/master/wgcf.sh | bash
+    curl -fsSL git.io/wgcf.sh | bash
 }
 
 Uninstall_wgcf() {
@@ -340,7 +344,47 @@ Read_WGCF_Profile() {
     WireGuard_Peer_PublicKey=$(cat ${WGCF_ProfilePath} | grep ^PublicKey | cut -d= -f2- | awk '$1=$1')
     WireGuard_Interface_Address_IPv4=$(echo ${WireGuard_Interface_Address} | cut -d, -f1 | cut -d'/' -f1)
     WireGuard_Interface_Address_IPv6=$(echo ${WireGuard_Interface_Address} | cut -d, -f2 | cut -d'/' -f1)
+    WireGuard_Interface_Address_IPv4_CIDR=$(echo ${WireGuard_Interface_Address} | cut -d, -f1 | awk \'$1=$1\')
+    WireGuard_Interface_Address_IPv6_CIDR=$(echo ${WireGuard_Interface_Address} | cut -d, -f2 | awk \'$1=$1\')
 }
+
+
+Disable_WG_Systemd_IPv4Only() {
+    rm -f "${WG_SYSTEMD_IPV4_ONLY_DROPIN}" "${WG_IPV4_ONLY_HELPER}"
+    rmdir --ignore-fail-on-non-empty "${WG_SYSTEMD_DROPIN_DIR}" 2>/dev/null || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
+Enable_WG_Systemd_IPv4Only() {
+    mkdir -p "${WG_SYSTEMD_DROPIN_DIR}"
+
+    cat > "${WG_IPV4_ONLY_HELPER}" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+CONF="/etc/wireguard/wgcf.conf"
+[[ -f "$CONF" ]] || exit 0
+
+# Keep only IPv4 in Address=
+sed -i -E 's/^(Address[[:space:]]*=[[:space:]]*[^,]+).*/\1/' "$CONF"
+# Keep only IPv4 in AllowedIPs=
+sed -i -E 's/^(AllowedIPs[[:space:]]*=[[:space:]]*[^,]+).*/\1/' "$CONF"
+# Force IPv4 DNS only
+sed -i -E 's/^DNS[[:space:]]*=.*/DNS = 1.1.1.1,1.0.0.1/' "$CONF"
+EOF
+    chmod 0755 "${WG_IPV4_ONLY_HELPER}"
+
+    cat > "${WG_SYSTEMD_IPV4_ONLY_DROPIN}" <<EOF
+[Unit]
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+ExecStartPre=${WG_IPV4_ONLY_HELPER}
+EOF
+
+    systemctl daemon-reload
+}
+
 
 Load_WGCF_Profile() {
     if [[ -f ${WGCF_Profile} ]]; then
@@ -358,6 +402,16 @@ Load_WGCF_Profile() {
 Install_WireGuardTools_Debian() {
     case ${SysInfo_OS_Ver_major} in
     10)
+        if [[ -z $(grep "^deb.*buster-backports.*main" /etc/apt/sources.list{,.d/*}) ]]; then
+            echo "deb http://deb.debian.org/debian buster-backports main" | tee /etc/apt/sources.list.d/backports.list
+        fi
+        ;;
+    *)
+        if [[ ${SysInfo_OS_Ver_major} -lt 10 ]]; then
+            log ERROR "This operating system is not supported."
+            exit 1
+        fi
+        ;;
     esac
     apt update
     apt install iproute2 openresolv -y
@@ -415,11 +469,11 @@ Install_WireGuardTools() {
 Install_WireGuardGo() {
     case ${SysInfo_Virt} in
     openvz | lxc*)
-        curl -fsSL https://raw.githubusercontent.com/NevermoreSSH/script/master/wireguard-go.sh | bash
+        curl -fsSL git.io/wireguard-go.sh | bash
         ;;
     *)
         if [[ ${SysInfo_Kernel_Ver_major} -lt 5 || ${SysInfo_Kernel_Ver_minor} -lt 6 ]]; then
-            curl -fsSL https://raw.githubusercontent.com/NevermoreSSH/script/master/wireguard-go.sh | bash
+            curl -fsSL git.io/wireguard-go.sh | bash
         fi
         ;;
     esac
@@ -549,23 +603,25 @@ Print_WireGuard_Log() {
 }
 
 Check_Network_Status_IPv4() {
-    if ping -c1 -W1 ${TestIPv4_1} >/dev/null 2>&1 || ping -c1 -W1 ${TestIPv4_2} >/dev/null 2>&1; then
+    if curl -4 -fsS --connect-timeout 2 --max-time 3 ${CF_Trace_URL} >/dev/null 2>&1; then
         IPv4Status='on'
     else
         IPv4Status='off'
     fi
 }
 
+
 Check_Network_Status_IPv6() {
-    if ping6 -c1 -W1 ${TestIPv6_1} >/dev/null 2>&1 || ping6 -c1 -W1 ${TestIPv6_2} >/dev/null 2>&1; then
+    if curl -6 -fsS --connect-timeout 2 --max-time 3 ${CF_Trace_URL} >/dev/null 2>&1; then
         IPv6Status='on'
     else
         IPv6Status='off'
     fi
 }
 
+
 Check_Network_Status() {
-    Disable_WireGuard
+    Stop_WireGuard
     Check_Network_Status_IPv4
     Check_Network_Status_IPv6
 }
@@ -643,7 +699,8 @@ Generate_WireGuardProfile_Interface() {
     Get_WireGuard_Interface_MTU
     log INFO "WireGuard profile (${WireGuard_ConfPath}) generation in progress..."
     cat <<EOF >${WireGuard_ConfPath}
-
+# Generated by P3TERX/warp.sh
+# Visit https://github.com/P3TERX/warp.sh for more information
 
 [Interface]
 PrivateKey = ${WireGuard_Interface_PrivateKey}
@@ -718,11 +775,11 @@ Check_WARP_Client_Status() {
     case ${WARP_Client_Status} in
     active)
         WARP_Client_Status_en="${FontColor_Green}Running${FontColor_Suffix}"
-        WARP_Client_Status_zh="${FontColor_Green}运行中${FontColor_Suffix}"
+        WARP_Client_Status_zh="${WARP_Client_Status_en}"
         ;;
     *)
         WARP_Client_Status_en="${FontColor_Red}Stopped${FontColor_Suffix}"
-        WARP_Client_Status_zh="${FontColor_Red}未运行${FontColor_Suffix}"
+        WARP_Client_Status_zh="${WARP_Client_Status_en}"
         ;;
     esac
 }
@@ -756,11 +813,11 @@ Check_WireGuard_Status() {
     case ${WireGuard_Status} in
     active)
         WireGuard_Status_en="${FontColor_Green}Running${FontColor_Suffix}"
-        WireGuard_Status_zh="${FontColor_Green}运行中${FontColor_Suffix}"
+        WireGuard_Status_zh="${WireGuard_Status_en}"
         ;;
     *)
         WireGuard_Status_en="${FontColor_Red}Stopped${FontColor_Suffix}"
-        WireGuard_Status_zh="${FontColor_Red}未运行${FontColor_Suffix}"
+        WireGuard_Status_zh="${WireGuard_Status_en}"
         ;;
     esac
 }
@@ -783,13 +840,13 @@ Check_WARP_WireGuard_Status() {
         ;;
     off)
         WARP_IPv4_Status_en="Normal"
-        WARP_IPv4_Status_zh="正常"
+        WARP_IPv4_Status_zh="Normal"
         ;;
     *)
         Check_Network_Status_IPv4
         if [[ ${IPv4Status} = on ]]; then
             WARP_IPv4_Status_en="Normal"
-            WARP_IPv4_Status_zh="正常"
+            WARP_IPv4_Status_zh="Normal"
         else
             WARP_IPv4_Status_en="${FontColor_Red}Unconnected${FontColor_Suffix}"
             WARP_IPv4_Status_zh="${FontColor_Red}未连接${FontColor_Suffix}"
@@ -813,13 +870,13 @@ Check_WARP_WireGuard_Status() {
         ;;
     off)
         WARP_IPv6_Status_en="Normal"
-        WARP_IPv6_Status_zh="正常"
+        WARP_IPv6_Status_zh="Normal"
         ;;
     *)
         Check_Network_Status_IPv6
         if [[ ${IPv6Status} = on ]]; then
             WARP_IPv6_Status_en="Normal"
-            WARP_IPv6_Status_zh="正常"
+            WARP_IPv6_Status_zh="Normal"
         else
             WARP_IPv6_Status_en="${FontColor_Red}Unconnected${FontColor_Suffix}"
             WARP_IPv6_Status_zh="${FontColor_Red}未连接${FontColor_Suffix}"
@@ -827,9 +884,8 @@ Check_WARP_WireGuard_Status() {
         ;;
     esac
     if [[ ${IPv4Status} = off && ${IPv6Status} = off ]]; then
-        log ERROR "Cloudflare WARP network anomaly, WireGuard tunnel established failed."
-        Disable_WireGuard
-        exit 1
+        log WARN "Network check failed (curl -4/-6). This VPS may block some traffic during setup. WireGuard will remain enabled."
+        return 0
     fi
 }
 
@@ -903,12 +959,12 @@ Set_WARP_IPv4() {
     Install_WireGuard
     Get_IP_addr
     Load_WGCF_Profile
-    if [[ ${IPv4Status} = off && ${IPv6Status} = on ]]; then
-        WireGuard_Interface_DNS="${WireGuard_Interface_DNS_64}"
-    else
-        WireGuard_Interface_DNS="${WireGuard_Interface_DNS_46}"
-    fi
+
+    # IPv4-only mode: force IPv4-only Address/DNS and enforce on every boot via systemd drop-in
+    WireGuard_Interface_Address="${WireGuard_Interface_Address_IPv4_CIDR}"
+    WireGuard_Interface_DNS="${WireGuard_Interface_DNS_IPv4}"
     WireGuard_Peer_AllowedIPs="${WireGuard_Peer_AllowedIPs_IPv4}"
+
     Check_WireGuard_Peer_Endpoint
     Generate_WireGuardProfile_Interface
     if [[ -n ${IPv4_addr} ]]; then
@@ -916,14 +972,20 @@ Set_WARP_IPv4() {
     fi
     Generate_WireGuardProfile_Peer
     View_WireGuard_Profile
+
+    Enable_WG_Systemd_IPv4Only
     Enable_WireGuard
     Print_WARP_WireGuard_Status
 }
+
 
 Set_WARP_IPv6() {
     Install_WireGuard
     Get_IP_addr
     Load_WGCF_Profile
+
+    # Set_WARP_IPv6_DROPIN_GUARD
+    Disable_WG_Systemd_IPv4Only
     if [[ ${IPv4Status} = off && ${IPv6Status} = on ]]; then
         WireGuard_Interface_DNS="${WireGuard_Interface_DNS_64}"
     else
@@ -945,6 +1007,9 @@ Set_WARP_DualStack() {
     Install_WireGuard
     Get_IP_addr
     Load_WGCF_Profile
+
+    # Set_WARP_DualStack_DROPIN_GUARD
+    Disable_WG_Systemd_IPv4Only
     WireGuard_Interface_DNS="${WireGuard_Interface_DNS_46}"
     WireGuard_Peer_AllowedIPs="${WireGuard_Peer_AllowedIPs_DualStack}"
     Check_WireGuard_Peer_Endpoint
@@ -965,6 +1030,9 @@ Set_WARP_DualStack_nonGlobal() {
     Install_WireGuard
     Get_IP_addr
     Load_WGCF_Profile
+
+    # Set_WARP_DualStack_nonGlobal_DROPIN_GUARD
+    Disable_WG_Systemd_IPv4Only
     WireGuard_Interface_DNS="${WireGuard_Interface_DNS_46}"
     WireGuard_Peer_AllowedIPs="${WireGuard_Peer_AllowedIPs_DualStack}"
     Check_WireGuard_Peer_Endpoint
@@ -976,7 +1044,7 @@ Set_WARP_DualStack_nonGlobal() {
     Print_WARP_WireGuard_Status
 }
 
-Menu_Title="${FontColor_Yellow_Bold}Cloudflare WARP 一键安装脚本${FontColor_Suffix} ${FontColor_Red}[${shVersion}]${FontColor_Suffix}   ${FontColor_Purple_Bold} ${FontColor_Suffix}"
+Menu_Title="${FontColor_Yellow_Bold}Cloudflare WARP Installer${FontColor_Suffix} ${FontColor_Red}[${shVersion}]${FontColor_Suffix}"
 
 Menu_WARP_Client() {
     clear
@@ -984,45 +1052,32 @@ Menu_WARP_Client() {
 ${Menu_Title}
 
  -------------------------
- WARP 客户端状态 : ${WARP_Client_Status_zh}
- SOCKS5 代理端口 : ${WARP_Proxy_Status_zh}
+ WARP Client Status : ${WARP_Client_Status_zh}
+ SOCKS5 Port        : ${WARP_Proxy_Status_zh}
  -------------------------
 
-管理 WARP 官方客户端：
+Manage WARP Official Client:
 
- ${FontColor_Green_Bold}0${FontColor_Suffix}. 返回主菜单
+ ${FontColor_Green_Bold}0${FontColor_Suffix}. Back to main menu
  -
- ${FontColor_Green_Bold}1${FontColor_Suffix}. 开启 SOCKS5 代理
- ${FontColor_Green_Bold}2${FontColor_Suffix}. 关闭 SOCKS5 代理
- ${FontColor_Green_Bold}3${FontColor_Suffix}. 重启 WARP 官方客户端
- ${FontColor_Green_Bold}4${FontColor_Suffix}. 卸载 WARP 官方客户端
+ ${FontColor_Green_Bold}1${FontColor_Suffix}. Enable SOCKS5 Proxy (legacy)
+ ${FontColor_Green_Bold}2${FontColor_Suffix}. Disable SOCKS5 Proxy (legacy)
+ ${FontColor_Green_Bold}3${FontColor_Suffix}. Restart WARP Client
+ ${FontColor_Green_Bold}4${FontColor_Suffix}. Uninstall WARP Client
 "
     unset MenuNumber
-    read -p "请输入选项: " MenuNumber
+    read -p "Enter option: " MenuNumber
     echo
     case ${MenuNumber} in
-    0)
-        Start_Menu
-        ;;
-    1)
-        Enable_WARP_Client_Proxy
-        ;;
-    2)
-        Disconnect_WARP
-        ;;
-    3)
-        Restart_WARP_Client
-        ;;
-    4)
-        Uninstall_WARP_Client
-        ;;
-    *)
-        log ERROR "无效输入！"
-        sleep 2s
-        Menu_WARP_Client
-        ;;
+    0) Start_Menu ;;
+    1) Enable_WARP_Client_Proxy ;;
+    2) Disconnect_WARP ;;
+    3) Restart_WARP_Client ;;
+    4) Uninstall_WARP_Client ;;
+    *) log ERROR "Invalid input!"; sleep 2s; Menu_WARP_Client ;;
     esac
 }
+
 
 Menu_WARP_WireGuard() {
     clear
@@ -1030,104 +1085,74 @@ Menu_WARP_WireGuard() {
 ${Menu_Title}
 
  -------------------------
- WireGuard 状态 : ${WireGuard_Status_zh}
- IPv4 网络状态  : ${WARP_IPv4_Status_zh}
- IPv6 网络状态  : ${WARP_IPv6_Status_zh}
+ WireGuard Status : ${WireGuard_Status_zh}
+ IPv4 Network     : ${WARP_IPv4_Status_zh}
+ IPv6 Network     : ${WARP_IPv6_Status_zh}
  -------------------------
 
-管理 WARP WireGuard：
+Manage WARP WireGuard:
 
- ${FontColor_Green_Bold}0${FontColor_Suffix}. 返回主菜单
+ ${FontColor_Green_Bold}0${FontColor_Suffix}. Back to main menu
  -
- ${FontColor_Green_Bold}1${FontColor_Suffix}. 查看 WARP WireGuard 日志
- ${FontColor_Green_Bold}2${FontColor_Suffix}. 重启 WARP WireGuard 服务
- ${FontColor_Green_Bold}3${FontColor_Suffix}. 关闭 WARP WireGuard 网络
+ ${FontColor_Green_Bold}1${FontColor_Suffix}. View WireGuard Logs
+ ${FontColor_Green_Bold}2${FontColor_Suffix}. Restart WireGuard Service
+ ${FontColor_Green_Bold}3${FontColor_Suffix}. Disable WireGuard
 "
     unset MenuNumber
-    read -p "请输入选项: " MenuNumber
+    read -p "Enter option: " MenuNumber
     echo
     case ${MenuNumber} in
-    0)
-        Start_Menu
-        ;;
-    1)
-        Print_WireGuard_Log
-        ;;
-    2)
-        Restart_WireGuard
-        ;;
-    3)
-        Disable_WireGuard
-        ;;
-    *)
-        log ERROR "无效输入！"
-        sleep 2s
-        Menu_Other
-        ;;
+    0) Start_Menu ;;
+    1) Print_WireGuard_Log ;;
+    2) Restart_WireGuard ;;
+    3) Disable_WireGuard ;;
+    *) log ERROR "Invalid input!"; sleep 2s; Menu_WARP_WireGuard ;;
     esac
 }
 
+
 Start_Menu() {
-    log INFO "正在检查状态..."
+    log INFO "Checking status..."
     Check_ALL_Status
     clear
     echo -e "
 ${Menu_Title}
 
  -------------------------
- WARP 客户端状态 : ${WARP_Client_Status_zh}
- SOCKS5 代理端口 : ${WARP_Proxy_Status_zh}
+ WARP Client Status : ${WARP_Client_Status_zh}
+ SOCKS5 Port        : ${WARP_Proxy_Status_zh}
  -------------------------
- WireGuard 状态 : ${WireGuard_Status_zh}
- IPv4 网络状态  : ${WARP_IPv4_Status_zh}
- IPv6 网络状态  : ${WARP_IPv6_Status_zh}
+ WireGuard Status : ${WireGuard_Status_zh}
+ IPv4 Network     : ${WARP_IPv4_Status_zh}
+ IPv6 Network     : ${WARP_IPv6_Status_zh}
  -------------------------
 
- ${FontColor_Green_Bold}1${FontColor_Suffix}. 安装 Cloudflare WARP 官方客户端
- ${FontColor_Green_Bold}2${FontColor_Suffix}. 自动配置 WARP 客户端 SOCKS5 代理
- ${FontColor_Green_Bold}3${FontColor_Suffix}. 管理 Cloudflare WARP 官方客户端
+ ${FontColor_Green_Bold}1${FontColor_Suffix}. Install Cloudflare WARP Official Client
+ ${FontColor_Green_Bold}2${FontColor_Suffix}. Auto-configure WARP SOCKS5 Proxy
+ ${FontColor_Green_Bold}3${FontColor_Suffix}. Manage WARP Official Client
  -
- ${FontColor_Green_Bold}4${FontColor_Suffix}. 安装 WireGuard 相关组件
- ${FontColor_Green_Bold}5${FontColor_Suffix}. 自动配置 WARP WireGuard IPv4 网络
- ${FontColor_Green_Bold}6${FontColor_Suffix}. 自动配置 WARP WireGuard IPv6 网络
- ${FontColor_Green_Bold}7${FontColor_Suffix}. 自动配置 WARP WireGuard 双栈全局网络
- ${FontColor_Green_Bold}8${FontColor_Suffix}. 管理 WARP WireGuard 网络
+ ${FontColor_Green_Bold}4${FontColor_Suffix}. Install WireGuard Components
+ ${FontColor_Green_Bold}5${FontColor_Suffix}. Configure WARP WireGuard IPv4 (Global)
+ ${FontColor_Green_Bold}6${FontColor_Suffix}. Configure WARP WireGuard IPv6 (Global)
+ ${FontColor_Green_Bold}7${FontColor_Suffix}. Configure WARP WireGuard Dual Stack (Global)
+ ${FontColor_Green_Bold}8${FontColor_Suffix}. Manage WARP WireGuard
 "
     unset MenuNumber
-    read -p "请输入选项: " MenuNumber
+    read -p "Enter option: " MenuNumber
     echo
     case ${MenuNumber} in
-    1)
-        Install_WARP_Client
-        ;;
-    2)
-        Enable_WARP_Client_Proxy
-        ;;
-    3)
-        Menu_WARP_Client
-        ;;
-    4)
-        Install_WireGuard
-        ;;
-    5)
-        Set_WARP_IPv4
-        ;;
-    6)
-        Set_WARP_IPv6
-        ;;
-    7)
-        Set_WARP_DualStack
-        ;;
-    8)
-        Menu_WARP_WireGuard
-        ;;
-    *)
-        log ERROR "无效输入！"
-        sleep 2s
-        Start_Menu
-        ;;
+    1) Install_WARP_Client ;;
+    2) Enable_WARP_Client_Proxy ;;
+    3) Menu_WARP_Client ;;
+    4) Install_WireGuard ;;
+    5) Set_WARP_IPv4 ;;
+    6) Set_WARP_IPv6 ;;
+    7) Set_WARP_DualStack ;;
+    8) Menu_WARP_WireGuard ;;
+    *) log ERROR "Invalid input!"; sleep 2s; Start_Menu ;;
     esac
 }
+
 
 Print_Usage() {
     echo -e "
@@ -1152,7 +1177,7 @@ SUBCOMMANDS:
     status          Prints status information
     version         Prints version information
     help            Prints this message or the help of the given subcommand(s)
-    menu            Chinese special features menu
+    menu            Interactive menu
 "
 }
 
@@ -1164,7 +1189,7 @@ cat <<-'EOM'
   [0;1;36;96m\[0m [0;1;34;94mV[0m  [0;1;35;95mV[0m [0;1;31;91m/[0m [0;1;33;93m_[0;1;32;92m__[0m [0;1;36;96m\[0;1;34;94m|[0m  [0;1;35;95m_[0m [0;1;31;91m<[0;1;33;93m|[0m  [0;1;32;92m_[0;1;36;96m_/[0m   [0;1;35;95m|[0m [0;1;31;91m|[0;1;33;93m|[0m [0;1;32;92m|[0m [0;1;36;96m|[0m [0;1;34;94m\_[0;1;35;95m_[0m [0;1;31;91m\[0m [0;1;33;93m||[0m [0;1;32;92m([0;1;36;96m_|[0m [0;1;34;94m|[0m [0;1;35;95m|[0m [0;1;31;91m|[0m  [0;1;32;92m__[0;1;36;96m/[0m [0;1;34;94m|[0m   
    [0;1;34;94m\[0;1;35;95m_/[0;1;31;91m\_[0;1;33;93m/_[0;1;32;92m/[0m   [0;1;34;94m\_[0;1;35;95m\_[0;1;31;91m|[0m [0;1;33;93m\_[0;1;32;92m\_[0;1;36;96m|[0m     [0;1;31;91m|_[0;1;33;93m__[0;1;32;92m|_[0;1;36;96m|[0m [0;1;34;94m|_[0;1;35;95m|_[0;1;31;91m__[0;1;33;93m/\[0;1;32;92m__[0;1;36;96m\_[0;1;34;94m_,[0;1;35;95m_|[0;1;31;91m_|[0;1;33;93m_|[0;1;32;92m\_[0;1;36;96m__[0;1;34;94m|_[0;1;35;95m|[0m   
                                                                     
-
+Copyright (C) P3TERX.COM | https://github.com/P3TERX/warp.sh
 
 EOM
 
