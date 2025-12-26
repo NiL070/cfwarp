@@ -282,7 +282,7 @@ while true; do
 
   line
   echo -e "${CB}${BOLD}$(center_text "WARP CLOUDFLARE CONTROL PANEL")${NC}"
-  echo -e "${DIM}$(center_text "(Simple Menu - ASCII Safe)")${NC}"
+  echo -e "${DIM}$(center_text "(Simple Menu - By NiLphreakz)")${NC}"
   line
 
   echo -e "${WB}${BOLD}Server Information${NC}"
