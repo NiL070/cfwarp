@@ -20,7 +20,7 @@ pause() {
 }
 
 # ===== WIDTH CONTROL (NOT TOO WIDE) =====
-MAX_COLS=80
+MAX_COLS=80   # kalau nak lebih kecil: 72
 MIN_COLS=60
 
 term_cols="$(tput cols 2>/dev/null || echo $MAX_COLS)"
@@ -67,6 +67,79 @@ menu_item_tag() {
   printf "  ${YB}%2s${NC} ${CB}>${NC} ${WB}%s ${tagc}${BOLD}[ %s ]${NC}\n" "$n" "$t" "$tag"
 }
 
+# ===== SOCKS5 V2 (warp-cli 2024+ / 2025+) =====
+enable_socks_40000_v2() {
+  clear
+  line
+  echo -e "${GB}${BOLD}Enable SOCKS5 :40000 (NEW warp-cli)${NC}"
+  line
+  echo
+
+  if ! command -v warp-cli >/dev/null 2>&1; then
+    echo -e "${RB}[ERR] warp-cli not found. Install Cloudflare WARP first.${NC}"
+    pause
+    return 1
+  fi
+
+  systemctl enable --now warp-svc >/dev/null 2>&1 || true
+
+  echo -e "${WB}[1/4] Registration check...${NC}"
+  if ! warp-cli --accept-tos registration show >/dev/null 2>&1; then
+    echo -e "${WB}[+] Registering device...${NC}"
+    warp-cli --accept-tos registration new || {
+      echo -e "${RB}[ERR] Registration failed.${NC}"
+      pause
+      return 1
+    }
+  else
+    echo -e "${GB}[OK] Registration exists.${NC}"
+  fi
+
+  echo -e "${WB}[2/4] Set mode: proxy${NC}"
+  warp-cli --accept-tos mode proxy || { echo -e "${RB}[ERR] Failed to set proxy mode.${NC}"; pause; return 1; }
+
+  echo -e "${WB}[3/4] Set SOCKS5 port: 40000${NC}"
+  warp-cli --accept-tos proxy port 40000 || { echo -e "${RB}[ERR] Failed to set proxy port 40000.${NC}"; pause; return 1; }
+
+  echo -e "${WB}[4/4] Connect...${NC}"
+  warp-cli --accept-tos connect || { echo -e "${RB}[ERR] Connect failed.${NC}"; pause; return 1; }
+
+  echo
+  warp-cli --accept-tos status || true
+  echo
+  ss -lntp 2>/dev/null | grep -q ":40000" \
+    && echo -e "${GB}[OK] SOCKS5 listening on 127.0.0.1:40000${NC}" \
+    || echo -e "${RB}[WARN] SOCKS5 port not listening.${NC}"
+
+  pause
+}
+
+disable_socks_40000_v2() {
+  clear
+  line
+  echo -e "${YB}${BOLD}Disable SOCKS5 :40000 (NEW warp-cli)${NC}"
+  line
+  echo
+
+  if ! command -v warp-cli >/dev/null 2>&1; then
+    echo -e "${RB}[ERR] warp-cli not found.${NC}"
+    pause
+    return 1
+  fi
+
+  warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
+  warp-cli --accept-tos mode warp >/dev/null 2>&1 || true
+
+  echo
+  warp-cli --accept-tos status || true
+  echo
+  ss -lntp 2>/dev/null | grep -q ":40000" \
+    && echo -e "${RB}[WARN] Port 40000 still listening (try restart warp-svc).${NC}" \
+    || echo -e "${GB}[OK] SOCKS5 port 40000 disabled.${NC}"
+
+  pause
+}
+
 # ===== FIX: Install wg + wg-quick (Debian 10) =====
 install_wg_tools_debian10() {
   clear
@@ -87,7 +160,7 @@ install_wg_tools_debian10() {
 
   echo -e "${WB}[1/4] Install dependencies...${NC}"
   apt update -y
-  apt install -y curl ca-certificates tar xz-utils gzip iproute2 openresolv
+  apt install -y curl ca-certificates tar xz-utils iproute2 openresolv
 
   if ! command -v make >/dev/null 2>&1 || ! command -v gcc >/dev/null 2>&1; then
     echo -e "${WB}[+] Installing build tools (build-essential)...${NC}"
@@ -101,42 +174,19 @@ install_wg_tools_debian10() {
   mkdir -p "$TMP"
   cd "$TMP" || { echo -e "${RB}[ERR] Cannot cd to $TMP${NC}"; pause; return 1; }
 
-  # try zx2c4 snapshot first
-  ok=0
-  curl -fL --retry 4 --retry-all-errors -o wireguard-tools.tar.xz \
-    "https://git.zx2c4.com/wireguard-tools/snapshot/wireguard-tools-${VER}.tar.xz" >/dev/null 2>&1 || ok=1
-
-  if [[ $ok -ne 0 ]] || [[ ! -s wireguard-tools.tar.xz ]] || [[ "$(stat -c%s wireguard-tools.tar.xz)" -lt 50000 ]]; then
-    echo -e "${YB}[WARN] zx2c4 download failed/broken. Trying GitHub fallback...${NC}"
-    curl -fL --retry 4 --retry-all-errors -o wireguard-tools.tar.gz \
-      "https://github.com/WireGuard/wireguard-tools/archive/refs/tags/${VER}.tar.gz" || {
-        echo -e "${RB}[ERR] Download failed (GitHub fallback).${NC}"
-        pause
-        return 1
-      }
-    echo -e "${WB}[3/4] Extract + build + install...${NC}"
-    tar -xzf wireguard-tools.tar.gz || { echo -e "${RB}[ERR] Extract failed.${NC}"; pause; return 1; }
-  else
-    # validate xz then extract
-    xz -t wireguard-tools.tar.xz >/dev/null 2>&1 || {
-      echo -e "${RB}[ERR] Downloaded xz is invalid. Try again later.${NC}"
+  curl -L -o wireguard-tools.tar.xz \
+    "https://git.zx2c4.com/wireguard-tools/snapshot/wireguard-tools-${VER}.tar.xz" || {
+      echo -e "${RB}[ERR] Download failed.${NC}"
       pause
       return 1
     }
-    echo -e "${WB}[3/4] Extract + build + install...${NC}"
-    tar -xf wireguard-tools.tar.xz || { echo -e "${RB}[ERR] Extract failed.${NC}"; pause; return 1; }
-  fi
 
+  echo -e "${WB}[3/4] Extract + build + install...${NC}"
+  tar -xf wireguard-tools.tar.xz || { echo -e "${RB}[ERR] Extract failed.${NC}"; pause; return 1; }
   cd wireguard-tools-* || { echo -e "${RB}[ERR] Source folder not found.${NC}"; pause; return 1; }
 
-  # IMPORTANT FIX:
-  # In this version, wg-quick is installed by "make -C src install".
-  # There's NO "contrib/wg-quick" directory -> remove that call.
-  make -C src -j"$(nproc)" && make -C src install || {
-    echo -e "${RB}[ERR] Build/install wg & wg-quick failed.${NC}"
-    pause
-    return 1
-  }
+  make -C src -j"$(nproc)" && make -C src install || { echo -e "${RB}[ERR] Build/install wg failed.${NC}"; pause; return 1; }
+  make -C contrib/wg-quick -j"$(nproc)" && make -C contrib/wg-quick install || { echo -e "${RB}[ERR] Build/install wg-quick failed.${NC}"; pause; return 1; }
 
   echo -e "${WB}[4/4] Verify...${NC}"
   if command -v wg >/dev/null 2>&1 && command -v wg-quick >/dev/null 2>&1; then
@@ -152,29 +202,45 @@ install_wg_tools_debian10() {
   pause
 }
 
-# ===== Status Box (warp2) =====
+# ===== Status Box (WARP2) =====
 get_status_box() {
   local out box
-  box=$' ----------------------------\n WireGuard      : Stopped\n IPv4 Network   : Normal\n IPv6 Network   : Unconnected\n ----------------------------\n'
 
-  out="$(warp2 status 2>/dev/null || true)"
+  box=$' ----------------------------\n WARP Client    : Stopped\n SOCKS5 Port    : Off\n ----------------------------\n WireGuard      : Stopped\n IPv4 Network   : Normal\n IPv6 Network   : Unconnected\n ----------------------------\n'
+
+  out="$(bash warp2 status 2>/dev/null || true)"
+
   if [[ -n "${out// /}" ]]; then
-    box="$(printf "%s\n" "$out" | sed -r 's/\x1B\[[0-9;]*[mK]//g')"
+    box="$(printf "%s\n" "$out" \
+      | sed -r 's/\x1B\[[0-9;]*[mK]//g' \
+      | awk '
+          BEGIN{p=0; dash=0}
+          /----------------------------/{
+            dash++
+            if(dash==1){p=1}
+          }
+          p==1{print}
+          (dash>=3){exit}
+        ' \
+    )"
   fi
 
-  [[ -z "${box// /}" ]] && box=$' ----------------------------\n WireGuard      : Stopped\n IPv4 Network   : Normal\n IPv6 Network   : Unconnected\n ----------------------------\n'
+  [[ -z "${box// /}" ]] && box=$' ----------------------------\n WARP Client    : Stopped\n SOCKS5 Port    : Off\n ----------------------------\n WireGuard      : Stopped\n IPv4 Network   : Normal\n IPv6 Network   : Unconnected\n ----------------------------\n'
   printf "%s\n" "$box"
 }
 
 print_status_box_colored() {
   local plain
   plain="$(get_status_box)"
+
   printf "%s\n" "$plain" | awk '
     function esc(c){ return sprintf("%c[%sm",27,c) }
     function reset(){ return sprintf("%c[0m",27) }
     function trim(s){ sub(/^[ \t]+/,"",s); sub(/[ \t]+$/,"",s); return s }
+
     /^[ \t-]*-+[ \t-]*$/ { print; next }
     /^[[:space:]]*$/ { print; next }
+
     {
       line=$0
       if (index(line,":")>0) {
@@ -182,11 +248,14 @@ print_status_box_colored() {
         left=a[1]
         val=substr(line,length(left)+2)
         val=trim(val)
+
         l=tolower(val)
         color=esc("37;1")
+
         if (l ~ /(stopped|off|unconnected|disconnected|not|fail)/) color=esc("31;1")
         if (l ~ /(running|warp\+|warp|plus|on|connected)/)          color=esc("32;1")
         if (l ~ /(normal)/)                                         color=esc("33;1")
+
         printf "%s: %s%s%s\n", left, color, val, reset()
         next
       }
@@ -236,6 +305,8 @@ while true; do
   menu_item "1"  "Install Cloudflare WARP Official"
   menu_item "2"  "Uninstall Cloudflare WARP Official"
   menu_item "3"  "Restart Cloudflare WARP Official"
+  menu_item_tag "4" "Enable WARP Client Proxy Mode (SOCKS5 port:40000)" "NEW" "GREEN"
+  menu_item_tag "5" "Disable WARP Client Proxy Mode" "NEW" "GREEN"
   menu_item "6"  "Install WireGuard components"
   menu_item "7"  "Configuration WARP IPv4"
   menu_item "8"  "Configuration WARP IPv6"
@@ -253,19 +324,21 @@ while true; do
 
   read -r -p "Select From Options [ 0 - 17 ] : " menu
   case "$menu" in
-    1)  clear; warp2 install;   pause ;;
-    2)  clear; warp2 uninstall; pause ;;
-    3)  clear; warp2 restart;   pause ;;
-    6)  clear; warp2 wg;        pause ;;
-    7)  clear; warp2 wg4;       pause ;;
-    8)  clear; warp2 wg6;       pause ;;
-    9)  clear; warp2 wgd;       pause ;;
-    10) clear; warp2 wgx;       pause ;;
-    11) clear; warp2 rwg;       pause ;;
-    12) clear; warp2 dwg;       pause ;;
-    13) clear; warp2 status;    pause ;;
-    14) clear; warp2 version;   pause ;;
-    15) clear; warp2 help;      pause ;;
+    1)  clear; bash warp2 install;   pause ;;
+    2)  clear; bash warp2 uninstall; pause ;;
+    3)  clear; bash warp2 restart;   pause ;;
+    4)  enable_socks_40000_v2 ;;
+    5)  disable_socks_40000_v2 ;;
+    6)  clear; bash warp2 wg;        pause ;;
+    7)  clear; bash warp2 wg4;       pause ;;
+    8)  clear; bash warp2 wg6;       pause ;;
+    9)  clear; bash warp2 wgd;       pause ;;
+    10) clear; bash warp2 wgx;       pause ;;
+    11) clear; bash warp2 rwg;       pause ;;
+    12) clear; bash warp2 dwg;       pause ;;
+    13) clear; bash warp2 status;    pause ;;
+    14) clear; bash warp2 version;   pause ;;
+    15) clear; bash warp2 help;      pause ;;
     16) clear; reboot ;;
     17) install_wg_tools_debian10 ;;
     0|q|Q|exit|EXIT) clear; exit 0 ;;
