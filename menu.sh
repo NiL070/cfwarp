@@ -1,78 +1,24 @@
 #!/bin/bash
 clear
 
-# ===== ANSI COLORS (SAFE / ASCII ONLY) =====
-NC='\e[0m'
-BOLD='\e[1m'
-DIM='\e[2m'
-
+y="\033[0;1;37m"
+wh="\033[0m"
 RB='\e[31;1m'
 GB='\e[32;1m'
 YB='\e[33;1m'
 BB='\e[34;1m'
-MB='\e[35;1m'
-CB='\e[36;1m'
 WB='\e[37;1m'
+NC='\e[0m'
 
 pause() {
   echo
-  read -r -p "Press ENTER to go back menu..." _
-}
-
-# ===== WIDTH CONTROL (NOT TOO WIDE) =====
-MAX_COLS=80   # kalau nak lebih kecil: 72
-MIN_COLS=60
-
-term_cols="$(tput cols 2>/dev/null || echo $MAX_COLS)"
-case "$term_cols" in
-  ''|*[!0-9]*) term_cols=$MAX_COLS ;;
-esac
-(( term_cols < MIN_COLS )) && term_cols=$MIN_COLS
-(( term_cols > MAX_COLS )) && term_cols=$MAX_COLS
-
-repeat_chr() { local ch="$1" n="$2"; printf "%*s" "$n" "" | tr " " "$ch"; }
-line()    { echo -e "${MB}$(repeat_chr "=" "$term_cols")${NC}"; }
-subline() { echo -e "${BB}$(repeat_chr "-" "$term_cols")${NC}"; }
-
-center_text() {
-  local text="$1"
-  local len=${#text}
-  local pad=$(( (term_cols - len) / 2 ))
-  (( pad < 0 )) && pad=0
-  printf "%*s%s\n" "$pad" "" "$text"
-}
-
-menu_item() {
-  local n="$1"; shift
-  local t="$*"
-  printf "  ${YB}%2s${NC} ${CB}>${NC} ${WB}%s${NC}\n" "$n" "$t"
-}
-
-menu_item_tag() {
-  local n="$1"; shift
-  local t="$1"; shift
-  local tag="$1"; shift
-  local color="$1"
-
-  local tagc="${WB}"
-  case "$color" in
-    GREEN) tagc="${GB}" ;;
-    YELLOW) tagc="${YB}" ;;
-    RED) tagc="${RB}" ;;
-    BLUE) tagc="${BB}" ;;
-    PURPLE) tagc="${MB}" ;;
-    CYAN) tagc="${CB}" ;;
-  esac
-
-  printf "  ${YB}%2s${NC} ${CB}>${NC} ${WB}%s ${tagc}${BOLD}[ %s ]${NC}\n" "$n" "$t" "$tag"
+  read -r -p "👉 Press ENTER to back menu..." _
 }
 
 # ===== SOCKS5 V2 (warp-cli 2024+ / 2025+) =====
 enable_socks_40000_v2() {
   clear
-  line
-  echo -e "${GB}${BOLD}Enable SOCKS5 :40000 (NEW warp-cli)${NC}"
-  line
+  echo -e "${YB}[*] Enable SOCKS5 :40000 (V2 - NEW warp-cli)${NC}"
   echo
 
   if ! command -v warp-cli >/dev/null 2>&1; then
@@ -86,7 +32,7 @@ enable_socks_40000_v2() {
   echo -e "${WB}[1/4] Registration check...${NC}"
   if ! warp-cli --accept-tos registration show >/dev/null 2>&1; then
     echo -e "${WB}[+] Registering device...${NC}"
-    warp-cli --accept-tos registration new || {
+    warp-cli --accept-tos registration new >/dev/null 2>&1 || warp-cli --accept-tos register || {
       echo -e "${RB}[ERR] Registration failed.${NC}"
       pause
       return 1
@@ -96,13 +42,21 @@ enable_socks_40000_v2() {
   fi
 
   echo -e "${WB}[2/4] Set mode: proxy${NC}"
-  warp-cli --accept-tos mode proxy || { echo -e "${RB}[ERR] Failed to set proxy mode.${NC}"; pause; return 1; }
+  warp-cli --accept-tos mode proxy >/dev/null 2>&1 || warp-cli --accept-tos set-mode proxy || {
+    echo -e "${RB}[ERR] Failed to set proxy mode.${NC}"
+    pause
+    return 1
+  }
 
   echo -e "${WB}[3/4] Set SOCKS5 port: 40000${NC}"
-  warp-cli --accept-tos proxy port 40000 || { echo -e "${RB}[ERR] Failed to set proxy port 40000.${NC}"; pause; return 1; }
+  warp-cli --accept-tos proxy port 40000 >/dev/null 2>&1 || true
 
   echo -e "${WB}[4/4] Connect...${NC}"
-  warp-cli --accept-tos connect || { echo -e "${RB}[ERR] Connect failed.${NC}"; pause; return 1; }
+  warp-cli --accept-tos connect || {
+    echo -e "${RB}[ERR] Connect failed.${NC}"
+    pause
+    return 1
+  }
 
   echo
   warp-cli --accept-tos status || true
@@ -116,9 +70,7 @@ enable_socks_40000_v2() {
 
 disable_socks_40000_v2() {
   clear
-  line
-  echo -e "${YB}${BOLD}Disable SOCKS5 :40000 (NEW warp-cli)${NC}"
-  line
+  echo -e "${YB}[*] Disable SOCKS5 :40000 (V2 - NEW warp-cli)${NC}"
   echo
 
   if ! command -v warp-cli >/dev/null 2>&1; then
@@ -128,7 +80,7 @@ disable_socks_40000_v2() {
   fi
 
   warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
-  warp-cli --accept-tos mode warp >/dev/null 2>&1 || true
+  warp-cli --accept-tos mode warp >/dev/null 2>&1 || warp-cli --accept-tos set-mode warp >/dev/null 2>&1 || true
 
   echo
   warp-cli --accept-tos status || true
@@ -143,13 +95,11 @@ disable_socks_40000_v2() {
 # ===== FIX: Install wg + wg-quick (Debian 10) =====
 install_wg_tools_debian10() {
   clear
-  line
-  echo -e "${YB}${BOLD}Debian 10 Fix: Install wg + wg-quick${NC}"
-  line
+  echo -e "${YB}[*] Debian 10 Fix: Install wg + wg-quick (wireguard-tools userspace)${NC}"
   echo
 
   if command -v wg >/dev/null 2>&1 && command -v wg-quick >/dev/null 2>&1; then
-    echo -e "${GB}[OK] wg and wg-quick already installed.${NC}"
+    echo -e "${GB}[OK] wg and wg-quick already installed:${NC}"
     echo " - wg      : $(command -v wg)"
     echo " - wg-quick: $(command -v wg-quick)"
     echo
@@ -181,12 +131,21 @@ install_wg_tools_debian10() {
       return 1
     }
 
-  echo -e "${WB}[3/4] Extract + build + install...${NC}"
+  echo -e "${WB}[3/4] Extract + build + install (wg + wg-quick)...${NC}"
   tar -xf wireguard-tools.tar.xz || { echo -e "${RB}[ERR] Extract failed.${NC}"; pause; return 1; }
   cd wireguard-tools-* || { echo -e "${RB}[ERR] Source folder not found.${NC}"; pause; return 1; }
 
-  make -C src -j"$(nproc)" && make -C src install || { echo -e "${RB}[ERR] Build/install wg failed.${NC}"; pause; return 1; }
-  make -C contrib/wg-quick -j"$(nproc)" && make -C contrib/wg-quick install || { echo -e "${RB}[ERR] Build/install wg-quick failed.${NC}"; pause; return 1; }
+  make -C src -j"$(nproc)" && make -C src install || {
+    echo -e "${RB}[ERR] Build/install wg failed.${NC}"
+    pause
+    return 1
+  }
+
+  make -C contrib/wg-quick -j"$(nproc)" && make -C contrib/wg-quick install || {
+    echo -e "${RB}[ERR] Build/install wg-quick failed.${NC}"
+    pause
+    return 1
+  }
 
   echo -e "${WB}[4/4] Verify...${NC}"
   if command -v wg >/dev/null 2>&1 && command -v wg-quick >/dev/null 2>&1; then
@@ -202,7 +161,7 @@ install_wg_tools_debian10() {
   pause
 }
 
-# ===== Status Box (WARP2) =====
+# Ambil status box dari output "bash warp2 status"
 get_status_box() {
   local out box
 
@@ -210,22 +169,23 @@ get_status_box() {
 
   out="$(bash warp2 status 2>/dev/null || true)"
 
-  if [[ -n "${out// /}" ]]; then
-    box="$(printf "%s\n" "$out" \
-      | sed -r 's/\x1B\[[0-9;]*[mK]//g' \
-      | awk '
-          BEGIN{p=0; dash=0}
-          /----------------------------/{
-            dash++
-            if(dash==1){p=1}
-          }
-          p==1{print}
-          (dash>=3){exit}
-        ' \
-    )"
+  box="$(printf "%s\n" "$out" \
+    | sed -r 's/\x1B\[[0-9;]*[mK]//g' \
+    | awk '
+        BEGIN{p=0; dash=0}
+        /----------------------------/{
+          dash++
+          if(dash==1){p=1}
+        }
+        p==1{print}
+        (dash>=3){exit}
+      ' \
+  )"
+
+  if [[ -z "${box// /}" ]]; then
+    box=$' ----------------------------\n WARP Client    : Stopped\n SOCKS5 Port    : Off\n ----------------------------\n WireGuard      : Stopped\n IPv4 Network   : Normal\n IPv6 Network   : Unconnected\n ----------------------------\n'
   fi
 
-  [[ -z "${box// /}" ]] && box=$' ----------------------------\n WARP Client    : Stopped\n SOCKS5 Port    : Off\n ----------------------------\n WireGuard      : Stopped\n IPv4 Network   : Normal\n IPv6 Network   : Unconnected\n ----------------------------\n'
   printf "%s\n" "$box"
 }
 
@@ -250,11 +210,17 @@ print_status_box_colored() {
         val=trim(val)
 
         l=tolower(val)
+
         color=esc("37;1")
 
-        if (l ~ /(stopped|off|unconnected|disconnected|not|fail)/) color=esc("31;1")
-        if (l ~ /(running|warp\+|warp|plus|on|connected)/)          color=esc("32;1")
-        if (l ~ /(normal)/)                                         color=esc("33;1")
+        if (l ~ /(stopped|off|unconnected|disconnected|not|fail)/)
+          color=esc("31;1")
+
+        if (l ~ /(running|warp\+|warp|plus|on)/)
+          color=esc("32;1")
+
+        if (l ~ /(normal)/)
+          color=esc("33;1")
 
         printf "%s: %s%s%s\n", left, color, val, reset()
         next
@@ -264,7 +230,6 @@ print_status_box_colored() {
   '
 }
 
-# ===== MAIN LOOP =====
 while true; do
   clear
 
@@ -276,51 +241,44 @@ while true; do
   [[ -z "$tram" ]] && tram="0"
   [[ -z "$uram" ]] && uram="0"
 
-  OS_NAME="$(lsb_release -ds 2>/dev/null || echo "Unknown OS")"
-  KERNEL="$(uname -r 2>/dev/null || echo "-")"
-  NOW="$(date 2>/dev/null || echo "-")"
+  echo ""
+  echo -e "$y                        MAIN MENU $wh"
+  echo -e "$y                Simple menu WARP Cloudflare $wh"
+  echo -e "${BB}--------------------------------------------------------${NC}"
+  echo -e "                ${WB}  Server Information "
+  echo -e "${BB}--------------------------------------------------------${NC}"
+  echo -e "  ${YB}OS      :${NC} $(lsb_release -ds)"
+  echo -e "  ${YB}KERNEL  :${NC} $(uname -r 2>/dev/null)"
+  echo -e "  ${YB}UPTIME  :${NC} $uptime"
+  echo -e "  ${YB}DATE    :${NC} $(date 2>/dev/null)"
+  echo -e "  ${YB}RAM     :${NC} $uram MB / $tram MB"
+  echo -e "  ${YB}IPVPS   :${NC} $IPVPS"
+  echo -e "${BB}--------------------------------------------------------${NC}"
 
-  line
-  echo -e "${CB}${BOLD}$(center_text "WARP CLOUDFLARE CONTROL PANEL")${NC}"
-  echo -e "${DIM}$(center_text "(Simple Menu - By NiLphreakz)")${NC}"
-  line
-
-  echo -e "${WB}${BOLD}Server Information${NC}"
-  subline
-  echo -e "  ${YB}OS     ${NC}: ${WB}${OS_NAME}${NC}"
-  echo -e "  ${YB}KERNEL ${NC}: ${WB}${KERNEL}${NC}"
-  echo -e "  ${YB}UPTIME ${NC}: ${WB}${uptime}${NC}"
-  echo -e "  ${YB}DATE   ${NC}: ${WB}${NOW}${NC}"
-  echo -e "  ${YB}RAM    ${NC}: ${WB}${uram} MB / ${tram} MB${NC}"
-  echo -e "  ${YB}IPVPS  ${NC}: ${WB}${IPVPS}${NC}"
-  line
-
-  echo -e "${WB}${BOLD}Status${NC}"
-  subline
+  echo
   print_status_box_colored
-  line
+  echo
 
-  echo -e "${WB}${BOLD}Menu Options${NC}"
-  subline
-  menu_item "1"  "Install Cloudflare WARP Official"
-  menu_item "2"  "Uninstall Cloudflare WARP Official"
-  menu_item "3"  "Restart Cloudflare WARP Official"
-  menu_item_tag "4" "Enable WARP Client Proxy Mode (SOCKS5 port:40000)" "NEW" "GREEN"
-  menu_item_tag "5" "Disable WARP Client Proxy Mode" "NEW" "GREEN"
-  menu_item "6"  "Install WireGuard components"
-  menu_item "7"  "Configuration WARP IPv4"
-  menu_item "8"  "Configuration WARP IPv6"
-  menu_item "9"  "Configuration WARP Dual Stack"
-  menu_item "10" "Configuration WARP Non-Global"
-  menu_item "11" "Restart WARP WireGuard service"
-  menu_item "12" "Disable WARP WireGuard service"
-  menu_item "13" "Status information"
-  menu_item "14" "Version information"
-  menu_item "15" "Help information"
-  menu_item "16" "Reboot"
-  menu_item "17" "FIX Debian10 (or old OS): Install wg + wg-quick"
-  echo -e "  ${YB} 0${NC} ${CB}>${NC} ${RB}${BOLD}Exit${NC}"
-  line
+  echo -e "${BB}--------------------------------------------------------${NC}"
+  echo -e "$YB 1$y.   Install Cloudflare WARP Official $wh"
+  echo -e "$YB 2$y.   Uninstall Cloudflare WARP Official  $wh"
+  echo -e "$YB 3$y.   Restart Cloudflare WARP Official  $wh"
+  echo -e "$YB 4$y.   Enable WARP Client Proxy Mode (SOCKS5 port:40000) ${GB}[NEW]${NC} $wh"
+  echo -e "$YB 5$y.   Disable WARP Client Proxy Mode ${GB}[NEW]${NC} $wh"
+  echo -e "$YB 6$y.   Install WireGuard components $wh"
+  echo -e "$YB 7$y.   Configuration WARP IPv4 $wh"
+  echo -e "$YB 8$y.   Configuration WARP IPv6 $wh"
+  echo -e "$YB 9$y.   Configuration WARP Dual Stack $wh"
+  echo -e "$YB 10$y.  Configuration WARP Non-Global $wh"
+  echo -e "$YB 11$y.  Restart WARP WireGuard service $wh"
+  echo -e "$YB 12$y.  Disable WARP WireGuard service $wh"
+  echo -e "$YB 13$y.  Status information $wh"
+  echo -e "$YB 14$y.  Version information $wh"
+  echo -e "$YB 15$y.  Help information $wh"
+  echo -e "$YB 16$y.  Reboot $wh"
+  echo -e "$YB 17$y.  FIX Debian10 (or old OS): Install wg + wg-quick $wh"
+  echo -e "$YB 0$y.   Exit $wh"
+  echo -e "${BB}--------------------------------------------------------${NC}"
 
   read -r -p "Select From Options [ 0 - 17 ] : " menu
   case "$menu" in
