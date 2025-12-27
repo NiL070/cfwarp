@@ -2,14 +2,16 @@
 set -euo pipefail
 
 # Cloudflare WARP Installer + WARP WireGuard (wgcf) manager
-# Custom:
-# - Robust wgcf profile parsing (fix Address empty)
-# - Ubuntu/Debian Cloudflare repo fallback codename
-# - wgcf install from GitHub releases (no git.io)
-# - IPv4-only systemd drop-in for wgcf (auto on boot for wg4)
-# - FIX: WireGuard install fallback build from source WITHOUT contrib/wg-quick
+# CUSTOM FIXED (FULL):
+# - Debian/Ubuntu Cloudflare repo fallback codename
+# - WARP proxy (new + legacy warp-cli)
+# - wgcf installer ikut repo asal: NevermoreSSH/script (bukan git.io)
+# - wireguard-go ikut repo asal: NevermoreSSH/script
+# - Robust wgcf register+generate (tak mati senyap bila wgcf exit code pelik)
+# - Pastikan /etc/warp/wgcf-profile.conf & /etc/wireguard/wgcf.conf memang dibuat
+# - IPv4-only systemd drop-in (ExecStartPre patch config untuk wg4)
 #
-shVersion='1.0.41_Final_CUSTOM_NO_MENU_WGQUICK_FIX'
+shVersion='1.0.41_Final_CUSTOM_FIXED_MERGED_REPO'
 
 FontColor_Red="\033[31m"
 FontColor_Green="\033[32m"
@@ -113,9 +115,6 @@ TestIPv6_1='2606:4700:4700::1001'
 TestIPv6_2='2620:fe::fe'
 CF_Trace_URL='https://www.cloudflare.com/cdn-cgi/trace'
 
-# Fallback wireguard-tools source version (matches common Debian10 builds)
-WGTOOLS_VER="1.0.20210914"
-
 # -----------------------------
 # System info
 # -----------------------------
@@ -127,6 +126,8 @@ Get_System_Info() {
   SysInfo_OS_Name_Full="${PRETTY_NAME:-Linux}"
   SysInfo_RelatedOS="${ID_LIKE:-}"
   SysInfo_Kernel="$(uname -r)"
+  SysInfo_Kernel_Ver_major="$(uname -r | awk -F . '{print $1}')"
+  SysInfo_Kernel_Ver_minor="$(uname -r | awk -F . '{print $2}')"
   SysInfo_Arch="$(uname -m)"
   SysInfo_Virt="$(command -v systemd-detect-virt >/dev/null 2>&1 && systemd-detect-virt || echo unknown)"
 
@@ -329,45 +330,17 @@ Disconnect_WARP() {
 Get_WARP_Proxy_Port() { WARP_Proxy_Port='40000'; }
 
 # -----------------------------
-# wgcf install + profile
+# wgcf install + profile (MERGED REPO + FIXED)
 # -----------------------------
 Install_wgcf() {
-  local arch
-  arch="$(uname -m)"
-  case "${arch}" in
-    x86_64|amd64) arch="amd64" ;;
-    aarch64|arm64) arch="arm64" ;;
-    armv7l|armv7) arch="armv7" ;;
-    *)
-      log ERROR "Unsupported architecture for wgcf binary: ${arch}"
-      exit 1
-      ;;
-  esac
+  # ikut repo/script asal yang kau bagi (NevermoreSSH)
+  log INFO "Installing wgcf via NevermoreSSH installer..."
+  curl -fsSL https://raw.githubusercontent.com/NevermoreSSH/script/master/wgcf.sh | bash
+}
 
-  log INFO "Installing wgcf (GitHub release) for arch: ${arch}"
-
-  local api url ver
-  api="$(curl -fsSL https://api.github.com/repos/ViRb3/wgcf/releases/latest)"
-  ver="$(echo "${api}" | grep -m1 '"tag_name"' | cut -d: -f2 | tr -d '", ' )"
-  if [[ -z "${ver}" ]]; then
-    log ERROR "Failed to detect latest wgcf version."
-    exit 1
-  fi
-
-  url="$(echo "${api}" | grep -Eo "https://[^\"]+wgcf_[^\"]+_linux_${arch}\.tar\.gz" | head -n1 || true)"
-  if [[ -z "${url}" ]]; then
-    log ERROR "Failed to find wgcf download URL for arch ${arch}."
-    exit 1
-  fi
-
-  local tmp
-  tmp="$(mktemp -d)"
-  curl -fsSL -o "${tmp}/wgcf.tgz" "${url}"
-  tar -xzf "${tmp}/wgcf.tgz" -C "${tmp}"
-  install -m 0755 "${tmp}/wgcf" /usr/local/bin/wgcf
-  rm -rf "${tmp}"
-
-  log INFO "wgcf installed: $(command -v wgcf) (version ${ver})"
+Uninstall_wgcf() {
+  # installer biasanya letak di /usr/local/bin/wgcf
+  rm -f /usr/local/bin/wgcf /usr/bin/wgcf /usr/sbin/wgcf 2>/dev/null || true
 }
 
 Generate_WGCF_Profile() {
@@ -375,27 +348,47 @@ Generate_WGCF_Profile() {
   local tmp
   tmp="$(mktemp -d)"
 
-  pushd "${tmp}" >/dev/null
-  Install_wgcf
+  # Jalankan dalam subshell supaya kalau fail, kita boleh print error jelas
+  (
+    set -euo pipefail
+    cd "${tmp}"
 
-  log INFO "Cloudflare WARP account registration (wgcf)..."
-  yes | wgcf register >/dev/null
+    Install_wgcf
 
-  log INFO "Generating wgcf profile..."
-  wgcf generate >/dev/null
+    log INFO "Cloudflare WARP account registration (wgcf)..."
 
-  if [[ ! -f "wgcf-profile.conf" ]]; then
-    log ERROR "wgcf-profile.conf not generated."
-    popd >/dev/null
-    rm -rf "${tmp}"
-    exit 1
-  fi
+    # wgcf kadang return rc != 0 walaupun 'nampak' berjaya, jadi jangan mati senyap
+    set +e
+    yes | wgcf register
+    rc=$?
+    set -e
 
-  install -m 0600 "wgcf-profile.conf" "${WGCF_ProfilePath}"
-  [[ -f "wgcf-account.toml" ]] && install -m 0600 "wgcf-account.toml" "${WGCF_AccountPath}" || true
+    if [[ ! -f "wgcf-account.toml" ]]; then
+      log ERROR "wgcf register FAILED (rc=${rc}). Cuba run semula untuk output penuh."
+      yes | wgcf register || true
+      ls -la || true
+      exit 1
+    fi
 
-  popd >/dev/null
+    log INFO "Generating wgcf profile..."
+
+    set +e
+    wgcf generate
+    rc=$?
+    set -e
+
+    if [[ ! -f "wgcf-profile.conf" ]]; then
+      log ERROR "wgcf generate FAILED (rc=${rc}). Output penuh dah dipaparkan."
+      ls -la || true
+      exit 1
+    fi
+
+    install -m 0600 "wgcf-profile.conf" "${WGCF_ProfilePath}"
+    install -m 0600 "wgcf-account.toml" "${WGCF_AccountPath}" || true
+  )
+
   rm -rf "${tmp}"
+  Uninstall_wgcf || true
 
   log INFO "Saved: ${WGCF_ProfilePath}"
 }
@@ -423,7 +416,7 @@ Read_WGCF_Profile() {
   if [[ -z "${WireGuard_Interface_PrivateKey}" || -z "${WireGuard_Peer_PublicKey}" || -z "${WireGuard_Interface_Address_IPv4_CIDR}" ]]; then
     log ERROR "Failed to parse wgcf profile (PrivateKey/PublicKey/Address)."
     log ERROR "Profile content:"
-    sed -n '1,120p' "${profile}" || true
+    sed -n '1,160p' "${profile}" || true
     exit 1
   fi
 }
@@ -441,78 +434,22 @@ Load_WGCF_Profile() {
 Install_WireGuardTools_DebianUbuntu() {
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
-  apt-get install -y iproute2 openresolv
+  apt-get install -y iproute2 openresolv wireguard-tools
 }
 
-_wireguard_tools_build_deps() {
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y
-  apt-get install -y \
-    ca-certificates curl tar xz-utils \
-    build-essential make gcc \
-    pkg-config \
-    || true
-}
-
-_wireguard_tools_build_from_source() {
-  log WARN "Falling back to build wireguard-tools from source (v${WGTOOLS_VER})..."
-
-  _wireguard_tools_build_deps
-
-  local tmp base url1 url2
-  tmp="$(mktemp -d)"
-  base="wireguard-tools-${WGTOOLS_VER}"
-  url1="https://git.zx2c4.com/wireguard-tools/snapshot/${base}.tar.xz"
-  url2="https://download.wireguard.com/wireguard-tools/${base}.tar.xz"
-
-  log INFO "[1/4] Install dependencies..."
-  # deps handled above
-
-  log INFO "[2/4] Download wireguard-tools source..."
-  if ! curl -fsSL -o "${tmp}/${base}.tar.xz" "${url1}"; then
-    log WARN "Primary URL failed, trying mirror..."
-    curl -fsSL -o "${tmp}/${base}.tar.xz" "${url2}"
-  fi
-
-  log INFO "[3/4] Extract + build + install..."
-  tar -xJf "${tmp}/${base}.tar.xz" -C "${tmp}"
-  if [[ ! -d "${tmp}/${base}/src" ]]; then
-    log ERROR "Unexpected wireguard-tools layout: missing src/"
-    rm -rf "${tmp}"
-    exit 1
-  fi
-
-  make -C "${tmp}/${base}/src"
-  make -C "${tmp}/${base}/src" install
-
-  # IMPORTANT FIX:
-  # Do NOT run `make -C contrib/wg-quick` because path may not exist
-  # and wg-quick is already installed by `make -C src install`.
-
-  log INFO "[4/4] Verify installation..."
-  if ! command -v wg >/dev/null 2>&1; then
-    log ERROR "wg not found after source install."
-    rm -rf "${tmp}"
-    exit 1
-  fi
-  if ! command -v wg-quick >/dev/null 2>&1; then
-    log ERROR "wg-quick not found after source install."
-    rm -rf "${tmp}"
-    exit 1
-  fi
-
-  rm -rf "${tmp}"
-  log INFO "wireguard-tools installed successfully (source build)."
-}
-
-_install_wireguard_tools_try_apt() {
-  # try apt install; return 0 if ok
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y
-  if apt-get install -y wireguard-tools; then
-    return 0
-  fi
-  return 1
+Install_WireGuardGo() {
+  # ikut repo/script asal (NevermoreSSH)
+  case "${SysInfo_Virt}" in
+    openvz|lxc*)
+      curl -fsSL https://raw.githubusercontent.com/NevermoreSSH/script/master/wireguard-go.sh | bash
+      ;;
+    *)
+      # kernel lama -> try wireguard-go
+      if [[ "${SysInfo_Kernel_Ver_major}" -lt 5 || "${SysInfo_Kernel_Ver_minor}" -lt 6 ]]; then
+        curl -fsSL https://raw.githubusercontent.com/NevermoreSSH/script/master/wireguard-go.sh | bash
+      fi
+      ;;
+  esac
 }
 
 Check_WireGuard() {
@@ -522,7 +459,6 @@ Check_WireGuard() {
 
 Install_WireGuard() {
   Print_System_Info
-
   if command -v wg >/dev/null 2>&1 && command -v wg-quick >/dev/null 2>&1; then
     log INFO "wireguard-tools already installed."
     return 0
@@ -530,27 +466,11 @@ Install_WireGuard() {
 
   log INFO "Installing wireguard-tools..."
   case "${SysInfo_OS_Name_lowercase}" in
-    debian|ubuntu)
-      Install_WireGuardTools_DebianUbuntu
-
-      if _install_wireguard_tools_try_apt; then
-        # some environments end up with wg but no wg-quick; verify
-        if command -v wg >/dev/null 2>&1 && command -v wg-quick >/dev/null 2>&1; then
-          log INFO "wireguard-tools installed via apt."
-          return 0
-        fi
-        log WARN "apt install done but wg-quick missing. Using source build fallback..."
-      else
-        log WARN "apt install wireguard-tools failed. Using source build fallback..."
-      fi
-
-      _wireguard_tools_build_from_source
-      ;;
-    *)
-      log ERROR "WireGuard install supported for Debian/Ubuntu only."
-      exit 1
-      ;;
+    debian|ubuntu) Install_WireGuardTools_DebianUbuntu ;;
+    *) log ERROR "WireGuard install supported for Debian/Ubuntu only."; exit 1 ;;
   esac
+
+  Install_WireGuardGo || true
 }
 
 Disable_WG_Systemd_IPv4Only() {
@@ -613,8 +533,7 @@ Start_WireGuard() {
 
   if [[ ! -f "${WireGuard_ConfPath}" ]]; then
     log ERROR "Missing WireGuard config: ${WireGuard_ConfPath}"
-    log ERROR "Run one of these to generate it: wg4 (IPv4), wg6 (IPv6), wgd (dual), wgx (non-global)."
-    log ERROR "Example: ./warp wg4"
+    log ERROR "Run: warp2 wg4 / wg6 / wgd / wgx"
     exit 1
   fi
 
@@ -631,7 +550,7 @@ Start_WireGuard() {
     log INFO "WireGuard is running."
   else
     log ERROR "WireGuard failed to run!"
-    journalctl -u wg-quick@${WireGuard_Interface} --no-pager | tail -n 120 || true
+    journalctl -u wg-quick@${WireGuard_Interface} --no-pager | tail -n 160 || true
     exit 1
   fi
 }
@@ -639,6 +558,7 @@ Start_WireGuard() {
 Restart_WireGuard() {
   Check_WARP_Client
   log INFO "Restarting WireGuard (${WireGuard_Interface})..."
+
   if [[ "${WARP_Client_Status}" == "active" ]]; then
     systemctl stop warp-svc || true
     systemctl restart wg-quick@${WireGuard_Interface}
@@ -652,7 +572,7 @@ Restart_WireGuard() {
     log INFO "WireGuard restarted."
   else
     log ERROR "WireGuard restart failed!"
-    journalctl -u wg-quick@${WireGuard_Interface} --no-pager | tail -n 120 || true
+    journalctl -u wg-quick@${WireGuard_Interface} --no-pager | tail -n 160 || true
     exit 1
   fi
 }
@@ -1027,7 +947,7 @@ Print_Usage() {
 Cloudflare WARP Installer [${shVersion}]
 
 USAGE:
-    warp [SUBCOMMAND]
+    warp2 [SUBCOMMAND]
 
 SUBCOMMANDS:
     install         Install Cloudflare WARP Official Linux Client (Debian/Ubuntu)
