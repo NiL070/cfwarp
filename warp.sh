@@ -7,8 +7,9 @@ set -euo pipefail
 # - Ubuntu/Debian Cloudflare repo fallback codename
 # - wgcf install from GitHub releases (no git.io)
 # - IPv4-only systemd drop-in for wgcf (auto on boot for wg4)
+# - FIX: WireGuard install fallback build from source WITHOUT contrib/wg-quick
 #
-shVersion='1.0.40_Final_CUSTOM_NO_MENU'
+shVersion='1.0.41_Final_CUSTOM_NO_MENU_WGQUICK_FIX'
 
 FontColor_Red="\033[31m"
 FontColor_Green="\033[32m"
@@ -111,6 +112,9 @@ TestIPv4_2='9.9.9.9'
 TestIPv6_1='2606:4700:4700::1001'
 TestIPv6_2='2620:fe::fe'
 CF_Trace_URL='https://www.cloudflare.com/cdn-cgi/trace'
+
+# Fallback wireguard-tools source version (matches common Debian10 builds)
+WGTOOLS_VER="1.0.20210914"
 
 # -----------------------------
 # System info
@@ -350,7 +354,7 @@ Install_wgcf() {
     exit 1
   fi
 
-  url="$(echo "${api}" | grep -Eo 'https://[^"]+wgcf_[^"]+_linux_'${arch}'\.tar\.gz' | head -n1 || true)"
+  url="$(echo "${api}" | grep -Eo "https://[^\"]+wgcf_[^\"]+_linux_${arch}\.tar\.gz" | head -n1 || true)"
   if [[ -z "${url}" ]]; then
     log ERROR "Failed to find wgcf download URL for arch ${arch}."
     exit 1
@@ -437,7 +441,78 @@ Load_WGCF_Profile() {
 Install_WireGuardTools_DebianUbuntu() {
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
-  apt-get install -y iproute2 openresolv wireguard-tools
+  apt-get install -y iproute2 openresolv
+}
+
+_wireguard_tools_build_deps() {
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y
+  apt-get install -y \
+    ca-certificates curl tar xz-utils \
+    build-essential make gcc \
+    pkg-config \
+    || true
+}
+
+_wireguard_tools_build_from_source() {
+  log WARN "Falling back to build wireguard-tools from source (v${WGTOOLS_VER})..."
+
+  _wireguard_tools_build_deps
+
+  local tmp base url1 url2
+  tmp="$(mktemp -d)"
+  base="wireguard-tools-${WGTOOLS_VER}"
+  url1="https://git.zx2c4.com/wireguard-tools/snapshot/${base}.tar.xz"
+  url2="https://download.wireguard.com/wireguard-tools/${base}.tar.xz"
+
+  log INFO "[1/4] Install dependencies..."
+  # deps handled above
+
+  log INFO "[2/4] Download wireguard-tools source..."
+  if ! curl -fsSL -o "${tmp}/${base}.tar.xz" "${url1}"; then
+    log WARN "Primary URL failed, trying mirror..."
+    curl -fsSL -o "${tmp}/${base}.tar.xz" "${url2}"
+  fi
+
+  log INFO "[3/4] Extract + build + install..."
+  tar -xJf "${tmp}/${base}.tar.xz" -C "${tmp}"
+  if [[ ! -d "${tmp}/${base}/src" ]]; then
+    log ERROR "Unexpected wireguard-tools layout: missing src/"
+    rm -rf "${tmp}"
+    exit 1
+  fi
+
+  make -C "${tmp}/${base}/src"
+  make -C "${tmp}/${base}/src" install
+
+  # IMPORTANT FIX:
+  # Do NOT run `make -C contrib/wg-quick` because path may not exist
+  # and wg-quick is already installed by `make -C src install`.
+
+  log INFO "[4/4] Verify installation..."
+  if ! command -v wg >/dev/null 2>&1; then
+    log ERROR "wg not found after source install."
+    rm -rf "${tmp}"
+    exit 1
+  fi
+  if ! command -v wg-quick >/dev/null 2>&1; then
+    log ERROR "wg-quick not found after source install."
+    rm -rf "${tmp}"
+    exit 1
+  fi
+
+  rm -rf "${tmp}"
+  log INFO "wireguard-tools installed successfully (source build)."
+}
+
+_install_wireguard_tools_try_apt() {
+  # try apt install; return 0 if ok
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y
+  if apt-get install -y wireguard-tools; then
+    return 0
+  fi
+  return 1
 }
 
 Check_WireGuard() {
@@ -447,6 +522,7 @@ Check_WireGuard() {
 
 Install_WireGuard() {
   Print_System_Info
+
   if command -v wg >/dev/null 2>&1 && command -v wg-quick >/dev/null 2>&1; then
     log INFO "wireguard-tools already installed."
     return 0
@@ -454,8 +530,26 @@ Install_WireGuard() {
 
   log INFO "Installing wireguard-tools..."
   case "${SysInfo_OS_Name_lowercase}" in
-    debian|ubuntu) Install_WireGuardTools_DebianUbuntu ;;
-    *) log ERROR "WireGuard install supported for Debian/Ubuntu only."; exit 1 ;;
+    debian|ubuntu)
+      Install_WireGuardTools_DebianUbuntu
+
+      if _install_wireguard_tools_try_apt; then
+        # some environments end up with wg but no wg-quick; verify
+        if command -v wg >/dev/null 2>&1 && command -v wg-quick >/dev/null 2>&1; then
+          log INFO "wireguard-tools installed via apt."
+          return 0
+        fi
+        log WARN "apt install done but wg-quick missing. Using source build fallback..."
+      else
+        log WARN "apt install wireguard-tools failed. Using source build fallback..."
+      fi
+
+      _wireguard_tools_build_from_source
+      ;;
+    *)
+      log ERROR "WireGuard install supported for Debian/Ubuntu only."
+      exit 1
+      ;;
   esac
 }
 
@@ -516,6 +610,14 @@ EOF
 Start_WireGuard() {
   Check_WARP_Client
   log INFO "Starting WireGuard (${WireGuard_Interface})..."
+
+  if [[ ! -f "${WireGuard_ConfPath}" ]]; then
+    log ERROR "Missing WireGuard config: ${WireGuard_ConfPath}"
+    log ERROR "Run one of these to generate it: wg4 (IPv4), wg6 (IPv6), wgd (dual), wgx (non-global)."
+    log ERROR "Example: ./warp wg4"
+    exit 1
+  fi
+
   if [[ "${WARP_Client_Status}" == "active" ]]; then
     systemctl stop warp-svc || true
     systemctl enable --now wg-quick@${WireGuard_Interface}
