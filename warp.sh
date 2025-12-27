@@ -2,16 +2,14 @@
 set -euo pipefail
 
 # Cloudflare WARP Installer + WARP WireGuard (wgcf) manager
-# CUSTOM FIXED (FULL):
-# - Debian/Ubuntu Cloudflare repo fallback codename
-# - WARP proxy (new + legacy warp-cli)
-# - wgcf installer ikut repo asal: NevermoreSSH/script (bukan git.io)
-# - wireguard-go ikut repo asal: NevermoreSSH/script
-# - Robust wgcf register+generate (tak mati senyap bila wgcf exit code pelik)
-# - Pastikan /etc/warp/wgcf-profile.conf & /etc/wireguard/wgcf.conf memang dibuat
-# - IPv4-only systemd drop-in (ExecStartPre patch config untuk wg4)
+# Custom Patched:
+# - Ensure /etc exists + resolv.conf sanity (fix resolvconf "/etc/resolv.conf: Directory nonexistent")
+# - IPv6 guard: detect sysctl IPv6 disabled and block wg6/dualstack early with clear message
+# - wgd auto-fallback to IPv4-only if host IPv6 not available/disabled
+# - wg4 always generates IPv4-only config (no ::/0, no IPv6 Address)
+# - wgcf install follows "repo atas" style (NevermoreSSH installer) + optional wireguard-go script
 #
-shVersion='1.0.41_Final_CUSTOM_FIXED_MERGED_REPO'
+shVersion='1.0.42_Final_CUSTOM_PATCHED'
 
 FontColor_Red="\033[31m"
 FontColor_Green="\033[32m"
@@ -51,29 +49,7 @@ need_cmd() {
   fi
 }
 
-Ensure_DNS_Resolver() {
-  # Fix broken /etc/resolv.conf symlink (common in minimal VPS)
-  if [[ -L /etc/resolv.conf ]]; then
-    local target
-    target="$(readlink -f /etc/resolv.conf || true)"
-    if [[ -z "${target}" || ! -f "${target}" ]]; then
-      log WARN "/etc/resolv.conf is a broken symlink. Replacing with a static resolv.conf."
-      rm -f /etc/resolv.conf
-      cat > /etc/resolv.conf <<'EOF'
-nameserver 1.1.1.1
-nameserver 8.8.8.8
-nameserver 9.9.9.9
-EOF
-    fi
-  elif [[ ! -f /etc/resolv.conf ]]; then
-    log WARN "/etc/resolv.conf missing. Creating a static resolv.conf."
-    cat > /etc/resolv.conf <<'EOF'
-nameserver 1.1.1.1
-nameserver 8.8.8.8
-nameserver 9.9.9.9
-EOF
-  fi
-}
+pause() { read -r -p "Press ENTER to continue..." _; }
 
 # -----------------------------
 # Paths / constants
@@ -116,6 +92,36 @@ TestIPv6_2='2620:fe::fe'
 CF_Trace_URL='https://www.cloudflare.com/cdn-cgi/trace'
 
 # -----------------------------
+# DNS resolver sanity
+# -----------------------------
+Ensure_DNS_Resolver() {
+  # Fix: ensure /etc exists (some broken minimal systems / containers)
+  mkdir -p /etc 2>/dev/null || true
+
+  # Fix broken /etc/resolv.conf symlink (common in minimal VPS)
+  if [[ -L /etc/resolv.conf ]]; then
+    local target
+    target="$(readlink -f /etc/resolv.conf 2>/dev/null || true)"
+    if [[ -z "${target}" || ! -f "${target}" ]]; then
+      log WARN "/etc/resolv.conf is a broken symlink. Replacing with a static resolv.conf."
+      rm -f /etc/resolv.conf
+      cat > /etc/resolv.conf <<'EOF'
+nameserver 1.1.1.1
+nameserver 8.8.8.8
+nameserver 9.9.9.9
+EOF
+    fi
+  elif [[ ! -f /etc/resolv.conf ]]; then
+    log WARN "/etc/resolv.conf missing. Creating a static resolv.conf."
+    cat > /etc/resolv.conf <<'EOF'
+nameserver 1.1.1.1
+nameserver 8.8.8.8
+nameserver 9.9.9.9
+EOF
+  fi
+}
+
+# -----------------------------
 # System info
 # -----------------------------
 Get_System_Info() {
@@ -126,8 +132,8 @@ Get_System_Info() {
   SysInfo_OS_Name_Full="${PRETTY_NAME:-Linux}"
   SysInfo_RelatedOS="${ID_LIKE:-}"
   SysInfo_Kernel="$(uname -r)"
-  SysInfo_Kernel_Ver_major="$(uname -r | awk -F . '{print $1}')"
-  SysInfo_Kernel_Ver_minor="$(uname -r | awk -F . '{print $2}')"
+  SysInfo_Kernel_Ver_major="$(uname -r | awk -F. '{print $1}' | tr -dc '0-9')"
+  SysInfo_Kernel_Ver_minor="$(uname -r | awk -F. '{print $2}' | tr -dc '0-9')"
   SysInfo_Arch="$(uname -m)"
   SysInfo_Virt="$(command -v systemd-detect-virt >/dev/null 2>&1 && systemd-detect-virt || echo unknown)"
 
@@ -152,6 +158,16 @@ System Information
         Codename  : ${SysInfo_OS_CodeName}
 ---------------------------------------------------
 "
+}
+
+# -----------------------------
+# IPv6 guards
+# -----------------------------
+IPv6_Is_Disabled() {
+  local v1 v2
+  v1="$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo 0)"
+  v2="$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null || echo 0)"
+  [[ "$v1" == "1" || "$v2" == "1" ]]
 }
 
 # -----------------------------
@@ -313,6 +329,7 @@ Init_WARP_Client() {
   if [[ "${WARP_Client_SelfStart}" != "enabled" || "${WARP_Client_Status}" != "active" ]]; then
     Install_WARP_Client
   fi
+  need_cmd warp-cli
 }
 
 Enable_WARP_Client_Proxy() {
@@ -330,17 +347,32 @@ Disconnect_WARP() {
 Get_WARP_Proxy_Port() { WARP_Proxy_Port='40000'; }
 
 # -----------------------------
-# wgcf install + profile (MERGED REPO + FIXED)
+# wgcf install + profile (repo atas: NevermoreSSH)
 # -----------------------------
 Install_wgcf() {
-  # ikut repo/script asal yang kau bagi (NevermoreSSH)
   log INFO "Installing wgcf via NevermoreSSH installer..."
   curl -fsSL https://raw.githubusercontent.com/NevermoreSSH/script/master/wgcf.sh | bash
+  if ! command -v wgcf >/dev/null 2>&1; then
+    log ERROR "wgcf install failed (wgcf not found)."
+    exit 1
+  fi
 }
 
-Uninstall_wgcf() {
-  # installer biasanya letak di /usr/local/bin/wgcf
-  rm -f /usr/local/bin/wgcf /usr/bin/wgcf /usr/sbin/wgcf 2>/dev/null || true
+Install_WireGuardGo_if_needed() {
+  # follows repo atas: NevermoreSSH wireguard-go installer if needed
+  case "${SysInfo_Virt}" in
+    openvz|lxc* )
+      log INFO "Installing wireguard-go (virt=${SysInfo_Virt})..."
+      curl -fsSL https://raw.githubusercontent.com/NevermoreSSH/script/master/wireguard-go.sh | bash
+      ;;
+    * )
+      local maj="${SysInfo_Kernel_Ver_major:-0}" min="${SysInfo_Kernel_Ver_minor:-0}"
+      if [[ "${maj}" -lt 5 ]] || ([[ "${maj}" -eq 5 ]] && [[ "${min}" -lt 6 ]]); then
+        log INFO "Kernel < 5.6 detected (${SysInfo_Kernel}). Installing wireguard-go..."
+        curl -fsSL https://raw.githubusercontent.com/NevermoreSSH/script/master/wireguard-go.sh | bash
+      fi
+      ;;
+  esac
 }
 
 Generate_WGCF_Profile() {
@@ -348,47 +380,27 @@ Generate_WGCF_Profile() {
   local tmp
   tmp="$(mktemp -d)"
 
-  # Jalankan dalam subshell supaya kalau fail, kita boleh print error jelas
-  (
-    set -euo pipefail
-    cd "${tmp}"
+  pushd "${tmp}" >/dev/null
+  Install_wgcf
 
-    Install_wgcf
+  log INFO "Cloudflare WARP account registration (wgcf)..."
+  yes | wgcf register >/dev/null
 
-    log INFO "Cloudflare WARP account registration (wgcf)..."
+  log INFO "Generating wgcf profile..."
+  wgcf generate >/dev/null
 
-    # wgcf kadang return rc != 0 walaupun 'nampak' berjaya, jadi jangan mati senyap
-    set +e
-    yes | wgcf register
-    rc=$?
-    set -e
+  if [[ ! -f "wgcf-profile.conf" ]]; then
+    log ERROR "wgcf-profile.conf not generated."
+    popd >/dev/null
+    rm -rf "${tmp}"
+    exit 1
+  fi
 
-    if [[ ! -f "wgcf-account.toml" ]]; then
-      log ERROR "wgcf register FAILED (rc=${rc}). Cuba run semula untuk output penuh."
-      yes | wgcf register || true
-      ls -la || true
-      exit 1
-    fi
+  install -m 0600 "wgcf-profile.conf" "${WGCF_ProfilePath}"
+  [[ -f "wgcf-account.toml" ]] && install -m 0600 "wgcf-account.toml" "${WGCF_AccountPath}" || true
 
-    log INFO "Generating wgcf profile..."
-
-    set +e
-    wgcf generate
-    rc=$?
-    set -e
-
-    if [[ ! -f "wgcf-profile.conf" ]]; then
-      log ERROR "wgcf generate FAILED (rc=${rc}). Output penuh dah dipaparkan."
-      ls -la || true
-      exit 1
-    fi
-
-    install -m 0600 "wgcf-profile.conf" "${WGCF_ProfilePath}"
-    install -m 0600 "wgcf-account.toml" "${WGCF_AccountPath}" || true
-  )
-
+  popd >/dev/null
   rm -rf "${tmp}"
-  Uninstall_wgcf || true
 
   log INFO "Saved: ${WGCF_ProfilePath}"
 }
@@ -416,7 +428,7 @@ Read_WGCF_Profile() {
   if [[ -z "${WireGuard_Interface_PrivateKey}" || -z "${WireGuard_Peer_PublicKey}" || -z "${WireGuard_Interface_Address_IPv4_CIDR}" ]]; then
     log ERROR "Failed to parse wgcf profile (PrivateKey/PublicKey/Address)."
     log ERROR "Profile content:"
-    sed -n '1,160p' "${profile}" || true
+    sed -n '1,120p' "${profile}" || true
     exit 1
   fi
 }
@@ -437,21 +449,6 @@ Install_WireGuardTools_DebianUbuntu() {
   apt-get install -y iproute2 openresolv wireguard-tools
 }
 
-Install_WireGuardGo() {
-  # ikut repo/script asal (NevermoreSSH)
-  case "${SysInfo_Virt}" in
-    openvz|lxc*)
-      curl -fsSL https://raw.githubusercontent.com/NevermoreSSH/script/master/wireguard-go.sh | bash
-      ;;
-    *)
-      # kernel lama -> try wireguard-go
-      if [[ "${SysInfo_Kernel_Ver_major}" -lt 5 || "${SysInfo_Kernel_Ver_minor}" -lt 6 ]]; then
-        curl -fsSL https://raw.githubusercontent.com/NevermoreSSH/script/master/wireguard-go.sh | bash
-      fi
-      ;;
-  esac
-}
-
 Check_WireGuard() {
   WireGuard_Status="$(systemctl is-active wg-quick@${WireGuard_Interface} 2>/dev/null || true)"
   WireGuard_SelfStart="$(systemctl is-enabled wg-quick@${WireGuard_Interface} 2>/dev/null || true)"
@@ -470,7 +467,7 @@ Install_WireGuard() {
     *) log ERROR "WireGuard install supported for Debian/Ubuntu only."; exit 1 ;;
   esac
 
-  Install_WireGuardGo || true
+  Install_WireGuardGo_if_needed
 }
 
 Disable_WG_Systemd_IPv4Only() {
@@ -502,7 +499,6 @@ awk -v addr="$addr4" -v dns="$dns" -v allowed="$allowed" '
   BEGIN{iniface=0}
   /^\[Interface\]/{iniface=1; print; next}
   /^\[/{iniface=0; print; next}
-
   {
     if (iniface && $0 ~ /^Address[[:space:]]*=/) { print "Address = " addr; next }
     if (iniface && $0 ~ /^DNS[[:space:]]*=/)     { print "DNS = " dns; next }
@@ -529,18 +525,18 @@ EOF
 
 Start_WireGuard() {
   Check_WARP_Client
-  log INFO "Starting WireGuard (${WireGuard_Interface})..."
 
   if [[ ! -f "${WireGuard_ConfPath}" ]]; then
-    log ERROR "Missing WireGuard config: ${WireGuard_ConfPath}"
-    log ERROR "Run: warp2 wg4 / wg6 / wgd / wgx"
+    log ERROR "WireGuard config not found: ${WireGuard_ConfPath}"
+    log ERROR "Run wg4/wg6/wgd/wgx to generate it first."
     exit 1
   fi
 
+  log INFO "Starting WireGuard (${WireGuard_Interface})..."
   if [[ "${WARP_Client_Status}" == "active" ]]; then
-    systemctl stop warp-svc || true
+    systemctl stop warp-svc >/dev/null 2>&1 || true
     systemctl enable --now wg-quick@${WireGuard_Interface}
-    systemctl start warp-svc || true
+    systemctl start warp-svc >/dev/null 2>&1 || true
   else
     systemctl enable --now wg-quick@${WireGuard_Interface}
   fi
@@ -550,7 +546,7 @@ Start_WireGuard() {
     log INFO "WireGuard is running."
   else
     log ERROR "WireGuard failed to run!"
-    journalctl -u wg-quick@${WireGuard_Interface} --no-pager | tail -n 160 || true
+    journalctl -u wg-quick@${WireGuard_Interface} --no-pager | tail -n 140 || true
     exit 1
   fi
 }
@@ -558,11 +554,10 @@ Start_WireGuard() {
 Restart_WireGuard() {
   Check_WARP_Client
   log INFO "Restarting WireGuard (${WireGuard_Interface})..."
-
   if [[ "${WARP_Client_Status}" == "active" ]]; then
-    systemctl stop warp-svc || true
+    systemctl stop warp-svc >/dev/null 2>&1 || true
     systemctl restart wg-quick@${WireGuard_Interface}
-    systemctl start warp-svc || true
+    systemctl start warp-svc >/dev/null 2>&1 || true
   else
     systemctl restart wg-quick@${WireGuard_Interface}
   fi
@@ -572,7 +567,7 @@ Restart_WireGuard() {
     log INFO "WireGuard restarted."
   else
     log ERROR "WireGuard restart failed!"
-    journalctl -u wg-quick@${WireGuard_Interface} --no-pager | tail -n 160 || true
+    journalctl -u wg-quick@${WireGuard_Interface} --no-pager | tail -n 140 || true
     exit 1
   fi
 }
@@ -583,11 +578,11 @@ Stop_WireGuard() {
   if [[ "${WireGuard_Status}" == "active" ]]; then
     log INFO "Stopping WireGuard..."
     if [[ "${WARP_Client_Status}" == "active" ]]; then
-      systemctl stop warp-svc || true
-      systemctl stop wg-quick@${WireGuard_Interface} || true
-      systemctl start warp-svc || true
+      systemctl stop warp-svc >/dev/null 2>&1 || true
+      systemctl stop wg-quick@${WireGuard_Interface} >/dev/null 2>&1 || true
+      systemctl start warp-svc >/dev/null 2>&1 || true
     else
-      systemctl stop wg-quick@${WireGuard_Interface} || true
+      systemctl stop wg-quick@${WireGuard_Interface} >/dev/null 2>&1 || true
     fi
   else
     log INFO "WireGuard already stopped."
@@ -600,11 +595,11 @@ Disable_WireGuard() {
   if [[ "${WireGuard_SelfStart}" == "enabled" || "${WireGuard_Status}" == "active" ]]; then
     log INFO "Disabling WireGuard..."
     if [[ "${WARP_Client_Status}" == "active" ]]; then
-      systemctl stop warp-svc || true
-      systemctl disable --now wg-quick@${WireGuard_Interface} || true
-      systemctl start warp-svc || true
+      systemctl stop warp-svc >/dev/null 2>&1 || true
+      systemctl disable --now wg-quick@${WireGuard_Interface} >/dev/null 2>&1 || true
+      systemctl start warp-svc >/dev/null 2>&1 || true
     else
-      systemctl disable --now wg-quick@${WireGuard_Interface} || true
+      systemctl disable --now wg-quick@${WireGuard_Interface} >/dev/null 2>&1 || true
     fi
     Check_WireGuard
     log INFO "WireGuard disabled."
@@ -625,6 +620,12 @@ Check_Network_Status_IPv4() {
 }
 
 Check_Network_Status_IPv6() {
+  # if OS IPv6 disabled, treat as off
+  if IPv6_Is_Disabled; then
+    IPv6Status='off'
+    return 0
+  fi
+
   if curl -6 -fsS --connect-timeout 2 --max-time 3 "${CF_Trace_URL}" >/dev/null 2>&1; then
     IPv6Status='on'
   else
@@ -641,8 +642,8 @@ Check_IPv4_addr() {
 
 Check_IPv6_addr() {
   IPv6_addr="$(
-    ip route get "${TestIPv6_1}" 2>/dev/null | grep -oP 'src \K\S+' ||
-    ip route get "${TestIPv6_2}" 2>/dev/null | grep -oP 'src \K\S+' || true
+    ip -6 route get "${TestIPv6_1}" 2>/dev/null | grep -oP 'src \K\S+' ||
+    ip -6 route get "${TestIPv6_2}" 2>/dev/null | grep -oP 'src \K\S+' || true
   )"
 }
 
@@ -700,6 +701,11 @@ PostUp = ip -4 rule add fwmark ${WireGuard_Interface_Rule_fwmark} lookup ${WireG
 PostDown = ip -4 rule delete fwmark ${WireGuard_Interface_Rule_fwmark} lookup ${WireGuard_Interface_Rule_table}
 PostUp = ip -4 rule add table main suppress_prefixlength 0
 PostDown = ip -4 rule delete table main suppress_prefixlength 0
+EOF
+
+  # only add v6 rules if OS IPv6 enabled
+  if ! IPv6_Is_Disabled; then
+    cat <<EOF >>"${WireGuard_ConfPath}"
 
 PostUp = ip -6 route add default dev ${WireGuard_Interface} table ${WireGuard_Interface_Rule_table}
 PostUp = ip -6 rule add from ${WireGuard_Interface_Address_IPv6} lookup ${WireGuard_Interface_Rule_table}
@@ -709,6 +715,7 @@ PostDown = ip -6 rule delete fwmark ${WireGuard_Interface_Rule_fwmark} lookup ${
 PostUp = ip -6 rule add table main suppress_prefixlength 0
 PostDown = ip -6 rule delete table main suppress_prefixlength 0
 EOF
+  fi
 }
 
 Generate_WireGuardProfile_Peer() {
@@ -730,7 +737,7 @@ View_WireGuard_Profile() {
 Check_WireGuard_Peer_Endpoint() {
   if ping -c1 -W1 "${WireGuard_Peer_Endpoint_IP4}" >/dev/null 2>&1; then
     WireGuard_Peer_Endpoint="${WireGuard_Peer_Endpoint_IPv4}"
-  elif ping6 -c1 -W1 "${WireGuard_Peer_Endpoint_IP6}" >/dev/null 2>&1; then
+  elif ! IPv6_Is_Disabled && ping6 -c1 -W1 "${WireGuard_Peer_Endpoint_IP6}" >/dev/null 2>&1; then
     WireGuard_Peer_Endpoint="${WireGuard_Peer_Endpoint_IPv6}"
   else
     WireGuard_Peer_Endpoint="${WireGuard_Peer_Endpoint_Domain}"
@@ -858,6 +865,8 @@ Set_WARP_IPv4() {
   Load_WGCF_Profile
 
   Disable_WG_Systemd_IPv4Only
+
+  # FORCE IPv4-only
   WireGuard_Interface_Address="${WireGuard_Interface_Address_IPv4_CIDR}"
   WireGuard_Interface_DNS="${WireGuard_Interface_DNS_IPv4}"
   WireGuard_Peer_AllowedIPs="${WireGuard_Peer_AllowedIPs_IPv4}"
@@ -879,6 +888,23 @@ Set_WARP_IPv6() {
   Install_WireGuard
   Get_IP_addr
   Load_WGCF_Profile
+
+  # Guard: IPv6 disabled at OS level
+  if IPv6_Is_Disabled; then
+    log ERROR "IPv6 is disabled on this device (sysctl disable_ipv6=1)."
+    log ERROR "Enable IPv6 first, then retry wg6."
+    log ERROR "Quick test enable:"
+    log ERROR "  sysctl -w net.ipv6.conf.all.disable_ipv6=0"
+    log ERROR "  sysctl -w net.ipv6.conf.default.disable_ipv6=0"
+    exit 1
+  fi
+
+  # Guard: no IPv6 connectivity detected
+  if [[ "${IPv6Status:-off}" != "on" ]]; then
+    log ERROR "Host IPv6 connectivity not available (IPv6Status=${IPv6Status:-off}). wg6 cannot work on this VPS."
+    log ERROR "Use wg4 (IPv4) or wgd (auto fallback IPv4-only)."
+    exit 1
+  fi
 
   Disable_WG_Systemd_IPv4Only
   WireGuard_Interface_Address="${WireGuard_Interface_Address_IPv6_CIDR}"
@@ -903,18 +929,32 @@ Set_WARP_DualStack() {
   Load_WGCF_Profile
 
   Disable_WG_Systemd_IPv4Only
-  WireGuard_Interface_Address="${WireGuard_Interface_Address}"
-  WireGuard_Interface_DNS="${WireGuard_Interface_DNS_46}"
-  WireGuard_Peer_AllowedIPs="${WireGuard_Peer_AllowedIPs_DualStack}"
+
+  # Auto fallback: if IPv6 disabled or not available, behave like wg4 (IPv4-only)
+  local enable_ipv6_rules="1"
+  if IPv6_Is_Disabled || [[ "${IPv6Status:-off}" != "on" || -z "${WireGuard_Interface_Address_IPv6_CIDR:-}" ]]; then
+    log WARN "Host IPv6 not available/disabled. Falling back to IPv4-only for wgd."
+    WireGuard_Interface_Address="${WireGuard_Interface_Address_IPv4_CIDR}"
+    WireGuard_Interface_DNS="${WireGuard_Interface_DNS_IPv4}"
+    WireGuard_Peer_AllowedIPs="${WireGuard_Peer_AllowedIPs_IPv4}"
+    enable_ipv6_rules="0"
+  else
+    WireGuard_Interface_Address="${WireGuard_Interface_Address}"
+    WireGuard_Interface_DNS="${WireGuard_Interface_DNS_46}"
+    WireGuard_Peer_AllowedIPs="${WireGuard_Peer_AllowedIPs_DualStack}"
+    enable_ipv6_rules="1"
+  fi
 
   Check_WireGuard_Peer_Endpoint
   Generate_WireGuardProfile_Interface
+
   if [[ -n "${IPv4_addr:-}" ]]; then
     Generate_WireGuardProfile_Interface_Rule_IPv4_Global_srcIP
   fi
-  if [[ -n "${IPv6_addr:-}" ]]; then
+  if [[ "${enable_ipv6_rules}" == "1" && -n "${IPv6_addr:-}" ]]; then
     Generate_WireGuardProfile_Interface_Rule_IPv6_Global_srcIP
   fi
+
   Generate_WireGuardProfile_Peer
   View_WireGuard_Profile
 
@@ -932,9 +972,27 @@ Set_WARP_DualStack_nonGlobal() {
   WireGuard_Interface_DNS="${WireGuard_Interface_DNS_46}"
   WireGuard_Peer_AllowedIPs="${WireGuard_Peer_AllowedIPs_DualStack}"
 
+  # If IPv6 disabled, strip v6 from address + allowedips for safety in non-global mode
+  if IPv6_Is_Disabled; then
+    log WARN "IPv6 disabled: switching wgx to IPv4-only rules."
+    WireGuard_Interface_Address="${WireGuard_Interface_Address_IPv4_CIDR}"
+    WireGuard_Interface_DNS="${WireGuard_Interface_DNS_IPv4}"
+    WireGuard_Peer_AllowedIPs="${WireGuard_Peer_AllowedIPs_IPv4}"
+  fi
+
   Check_WireGuard_Peer_Endpoint
   Generate_WireGuardProfile_Interface
-  Generate_WireGuardProfile_Interface_Rule_DualStack_nonGlobal
+
+  # For non-global, only apply table/off rules if dualstack is actually used.
+  if [[ "${WireGuard_Peer_AllowedIPs}" == "${WireGuard_Peer_AllowedIPs_DualStack}" ]]; then
+    Generate_WireGuardProfile_Interface_Rule_DualStack_nonGlobal
+  else
+    # For IPv4-only wgx, mimic wg4 global table/rules (simple)
+    if [[ -n "${IPv4_addr:-}" ]]; then
+      Generate_WireGuardProfile_Interface_Rule_IPv4_Global_srcIP
+    fi
+  fi
+
   Generate_WireGuardProfile_Peer
   View_WireGuard_Profile
 
@@ -957,8 +1015,8 @@ SUBCOMMANDS:
     unproxy         Disable WARP Client Proxy Mode
     wg              Install WireGuard components
     wg4             Configure WARP IPv4 (WireGuard)  [IPv4-only + systemd drop-in]
-    wg6             Configure WARP IPv6 (WireGuard)
-    wgd             Configure WARP Dual Stack (WireGuard)
+    wg6             Configure WARP IPv6 (WireGuard)  [Guarded if IPv6 disabled]
+    wgd             Configure WARP Dual Stack (WireGuard) [Auto fallback to IPv4-only]
     wgx             Configure WARP Non-Global (WireGuard)
     rwg             Restart WARP WireGuard service
     dwg             Disable WARP WireGuard service
