@@ -180,10 +180,11 @@ install_wg_tools_debian10() {
 }
 
 # =========================
-# STATUS BOX (FIXED)
+# STATUS BOX (FIXED + CACHED)
 # - Detect active wg-quick@wgcf4/wgcf6/wgcfd/wgcfng
 # - Show MODE name
 # - Show socks status + warp ipv4/ipv6 trace
+# - Cache results (3-5s) to reduce lag
 # =========================
 detect_active_wg_iface() {
   local ifaces=("wgcf4" "wgcf6" "wgcfd" "wgcfng")
@@ -224,17 +225,64 @@ detect_socks5_port_40000() {
   return 1
 }
 
+# ---- CACHE ----
+CACHE_TTL=4
+
+__cache_v4_ts=0
+__cache_v6_ts=0
+__cache_s5_ts=0
+__cache_v4_val=""
+__cache_v6_val=""
+__cache_s5_val=""
+
+now_ts() { date +%s; }
+
+cached_cf_trace_warp_v4() {
+  local now
+  now="$(now_ts)"
+  if (( now - __cache_v4_ts < CACHE_TTL )) && [[ -n "$__cache_v4_val" ]]; then
+    echo "$__cache_v4_val"
+    return 0
+  fi
+  __cache_v4_val="$(cf_trace_warp_v4)"
+  __cache_v4_ts="$now"
+  echo "$__cache_v4_val"
+}
+
+cached_cf_trace_warp_v6() {
+  local now
+  now="$(now_ts)"
+  if (( now - __cache_v6_ts < CACHE_TTL )) && [[ -n "$__cache_v6_val" ]]; then
+    echo "$__cache_v6_val"
+    return 0
+  fi
+  __cache_v6_val="$(cf_trace_warp_v6)"
+  __cache_v6_ts="$now"
+  echo "$__cache_v6_val"
+}
+
+cached_detect_socks5_port_40000() {
+  local now
+  now="$(now_ts)"
+  if (( now - __cache_s5_ts < CACHE_TTL )) && [[ -n "$__cache_s5_val" ]]; then
+    echo "$__cache_s5_val"
+    return 0
+  fi
+  __cache_s5_val="$(detect_socks5_port_40000)"
+  __cache_s5_ts="$now"
+  echo "$__cache_s5_val"
+}
+
 get_status_box() {
   local warp_svc socks wg_iface wg_stat mode v4 v6
 
-  # warp-svc
   if systemctl is-active warp-svc >/dev/null 2>&1; then
     warp_svc="Running"
   else
     warp_svc="Stopped"
   fi
 
-  socks="$(detect_socks5_port_40000)"
+  socks="$(cached_detect_socks5_port_40000)"
 
   wg_iface="$(detect_active_wg_iface)"
   mode=$(case "$wg_iface" in wgcf4)echo "IPv4";; wgcf6)echo "IPv6";; wgcfd)echo "Dual";; wgcfng)echo "Non-Global";; *)echo "-";; esac)
@@ -245,8 +293,8 @@ get_status_box() {
     wg_stat="Stopped"
   fi
 
-  v4="$(cf_trace_warp_v4)"
-  v6="$(cf_trace_warp_v6)"
+  v4="$(cached_cf_trace_warp_v4)"
+  v6="$(cached_cf_trace_warp_v6)"
 
   case "$v4" in
     on)   v4="WARP" ;;
