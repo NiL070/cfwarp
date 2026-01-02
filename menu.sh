@@ -15,7 +15,9 @@ pause() {
   read -r -p "👉 Press ENTER to back menu..." _
 }
 
-# ===== SOCKS5 V2 (warp-cli 2024+ / 2025+) =====
+# =========================
+# SOCKS5 V2 (warp-cli 2024+ / 2025+)
+# =========================
 enable_socks_40000_v2() {
   clear
   echo -e "${YB}[*] Enable SOCKS5 :40000 (V2 - NEW warp-cli)${NC}"
@@ -92,7 +94,9 @@ disable_socks_40000_v2() {
   pause
 }
 
-# ===== FIX: Install wg + wg-quick (Debian 10) =====
+# =========================
+# FIX: Install wg + wg-quick (Debian 10)
+# =========================
 install_wg_tools_debian10() {
   clear
   echo -e "${YB}[*] Debian 10 Fix: Install wg + wg-quick (wireguard-tools userspace)${NC}"
@@ -141,11 +145,25 @@ install_wg_tools_debian10() {
     return 1
   }
 
-  make -C contrib/wg-quick -j"$(nproc)" && make -C contrib/wg-quick install || {
-    echo -e "${RB}[ERR] Build/install wg-quick failed.${NC}"
-    pause
-    return 1
-  }
+  if ! command -v wg-quick >/dev/null 2>&1; then
+    if [[ -d contrib/wg-quick ]]; then
+      make -C contrib/wg-quick -j"$(nproc)" && make -C contrib/wg-quick install || {
+        echo -e "${RB}[ERR] Build/install wg-quick failed.${NC}"
+        pause
+        return 1
+      }
+    elif [[ -d src/wg-quick ]]; then
+      make -C src/wg-quick -j"$(nproc)" && make -C src/wg-quick install || {
+        echo -e "${RB}[ERR] Build/install wg-quick failed.${NC}"
+        pause
+        return 1
+      }
+    else
+      echo -e "${RB}[ERR] wg-quick not found in snapshot dirs.${NC}"
+      pause
+      return 1
+    fi
+  fi
 
   echo -e "${WB}[4/4] Verify...${NC}"
   if command -v wg >/dev/null 2>&1 && command -v wg-quick >/dev/null 2>&1; then
@@ -161,32 +179,100 @@ install_wg_tools_debian10() {
   pause
 }
 
-# Ambil status box dari output "bash warp2 status"
+# =========================
+# STATUS BOX (FIXED)
+# - Detect active wg-quick@wgcf4/wgcf6/wgcfd/wgcfng
+# - Show MODE name
+# - Show socks status + warp ipv4/ipv6 trace
+# =========================
+detect_active_wg_iface() {
+  local ifaces=("wgcf4" "wgcf6" "wgcfd" "wgcfng")
+  local i
+  for i in "${ifaces[@]}"; do
+    if systemctl is-active "wg-quick@${i}" >/dev/null 2>&1; then
+      echo "$i"
+      return 0
+    fi
+  done
+  echo "-"
+  return 1
+}
+
+cf_trace_warp_v4() {
+  curl -s4 --connect-timeout 2 --max-time 3 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null \
+    | awk -F= '/^warp=/{print $2; exit}'
+}
+
+cf_trace_warp_v6() {
+  curl -s6 --connect-timeout 2 --max-time 3 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null \
+    | awk -F= '/^warp=/{print $2; exit}'
+}
+
+detect_socks5_port_40000() {
+  if ss -lntp 2>/dev/null | grep -qE '127\.0\.0\.1:40000|:40000'; then
+    local r
+    r=$(curl -sx "socks5h://127.0.0.1:40000" --connect-timeout 2 --max-time 3 -s https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null \
+      | awk -F= '/^warp=/{print $2; exit}')
+    if [[ "$r" == "on" || "$r" == "plus" ]]; then
+      echo "On(:40000)"
+      return 0
+    fi
+    echo "Listening(:40000)"
+    return 0
+  fi
+  echo "Off"
+  return 1
+}
+
 get_status_box() {
-  local out box
+  local warp_svc socks wg_iface wg_stat mode v4 v6
 
-  box=$' ----------------------------\n WARP Client    : Stopped\n SOCKS5 Port    : Off\n ----------------------------\n WireGuard      : Stopped\n IPv4 Network   : Normal\n IPv6 Network   : Unconnected\n ----------------------------\n'
-
-  out="$(bash warp2 status 2>/dev/null || true)"
-
-  box="$(printf "%s\n" "$out" \
-    | sed -r 's/\x1B\[[0-9;]*[mK]//g' \
-    | awk '
-        BEGIN{p=0; dash=0}
-        /----------------------------/{
-          dash++
-          if(dash==1){p=1}
-        }
-        p==1{print}
-        (dash>=3){exit}
-      ' \
-  )"
-
-  if [[ -z "${box// /}" ]]; then
-    box=$' ----------------------------\n WARP Client    : Stopped\n SOCKS5 Port    : Off\n ----------------------------\n WireGuard      : Stopped\n IPv4 Network   : Normal\n IPv6 Network   : Unconnected\n ----------------------------\n'
+  # warp-svc
+  if systemctl is-active warp-svc >/dev/null 2>&1; then
+    warp_svc="Running"
+  else
+    warp_svc="Stopped"
   fi
 
-  printf "%s\n" "$box"
+  socks="$(detect_socks5_port_40000)"
+
+  wg_iface="$(detect_active_wg_iface)"
+  mode=$(case "$wg_iface" in wgcf4)echo "IPv4";; wgcf6)echo "IPv6";; wgcfd)echo "Dual";; wgcfng)echo "Non-Global";; *)echo "-";; esac)
+
+  if [[ "$wg_iface" != "-" ]]; then
+    wg_stat="Running (${wg_iface})"
+  else
+    wg_stat="Stopped"
+  fi
+
+  v4="$(cf_trace_warp_v4)"
+  v6="$(cf_trace_warp_v6)"
+
+  case "$v4" in
+    on)   v4="WARP" ;;
+    plus) v4="WARP+" ;;
+    off|"") v4="Normal" ;;
+    *)    v4="Normal" ;;
+  esac
+
+  case "$v6" in
+    on)   v6="WARP" ;;
+    plus) v6="WARP+" ;;
+    off|"") v6="Normal/NoV6" ;;
+    *)    v6="Normal/NoV6" ;;
+  esac
+
+  cat <<EOF
+ ----------------------------
+ WARP Client    : ${warp_svc}
+ SOCKS5 Port    : ${socks}
+ ----------------------------
+ WireGuard      : ${wg_stat}
+ WG Mode        : ${mode}
+ IPv4 Network   : ${v4}
+ IPv6 Network   : ${v6}
+ ----------------------------
+EOF
 }
 
 print_status_box_colored() {
@@ -208,19 +294,12 @@ print_status_box_colored() {
         left=a[1]
         val=substr(line,length(left)+2)
         val=trim(val)
-
         l=tolower(val)
 
         color=esc("37;1")
-
-        if (l ~ /(stopped|off|unconnected|disconnected|not|fail)/)
-          color=esc("31;1")
-
-        if (l ~ /(running|warp\+|warp|plus|on)/)
-          color=esc("32;1")
-
-        if (l ~ /(normal)/)
-          color=esc("33;1")
+        if (l ~ /(stopped|off|unconnected|disconnected|nov6|no v6|fail|normal\/nov6)/) color=esc("31;1")
+        if (l ~ /(running|warp\+|warp|plus|on|listening)/) color=esc("32;1")
+        if (l ~ /(normal)/) color=esc("33;1")
 
         printf "%s: %s%s%s\n", left, color, val, reset()
         next
@@ -230,10 +309,13 @@ print_status_box_colored() {
   '
 }
 
+# =========================
+# MAIN LOOP
+# =========================
 while true; do
   clear
 
-  IPVPS=$(curl -s ipv4.icanhazip.com || curl -s ipinfo.io/ip || curl -s ifconfig.me)
+  IPVPS=$(curl -s4 ipv4.icanhazip.com 2>/dev/null || curl -s4 ipinfo.io/ip 2>/dev/null || curl -s4 ifconfig.me 2>/dev/null)
   uptime="$(uptime -p 2>/dev/null | cut -d ' ' -f2-)"
   [[ -z "$uptime" ]] && uptime="-"
   tram=$(free -m 2>/dev/null | awk 'NR==2{print $2}')
@@ -241,13 +323,16 @@ while true; do
   [[ -z "$tram" ]] && tram="0"
   [[ -z "$uram" ]] && uram="0"
 
+  OSNAME="$(lsb_release -ds 2>/dev/null)"
+  [[ -z "$OSNAME" ]] && OSNAME="$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-Unknown}")"
+
   echo ""
   echo -e "$y                        MAIN MENU $wh"
   echo -e "$y                Simple menu WARP Cloudflare $wh"
   echo -e "${BB}--------------------------------------------------------${NC}"
   echo -e "                ${WB}  Server Information "
   echo -e "${BB}--------------------------------------------------------${NC}"
-  echo -e "  ${YB}OS      :${NC} $(lsb_release -ds)"
+  echo -e "  ${YB}OS      :${NC} ${OSNAME}"
   echo -e "  ${YB}KERNEL  :${NC} $(uname -r 2>/dev/null)"
   echo -e "  ${YB}UPTIME  :${NC} $uptime"
   echo -e "  ${YB}DATE    :${NC} $(date 2>/dev/null)"
