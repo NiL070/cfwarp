@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 #
-# Cloudflare WARP Installer (P3TERX warp.sh) - patched for Debian10 + warp-cli NEW + /etc/wireguard fix
+# Cloudflare WARP Installer (P3TERX warp.sh) - patched:
+# A) Correct per-mode Address/DNS (IPv4-only / IPv6-only / Dual)
+# B) Idempotent ip rule (PreUp del / PostDown del)
+# C) Fix non-global PostUp + route replace
+# D) Separate interfaces + systemd units per mode; auto-disable others
 #
 
-shVersion='beta39-patched2'
+shVersion='beta39-patched3-A_B_C_D'
 
 FontColor_Red="\033[31m"
 FontColor_Red_Bold="\033[1;31m"
@@ -55,13 +59,21 @@ WGCF_Profile='wgcf-profile.conf'
 WGCF_ProfileDir="/etc/warp"
 WGCF_ProfilePath="${WGCF_ProfileDir}/${WGCF_Profile}"
 
-WireGuard_Interface='wgcf'
-WireGuard_ConfPath="/etc/wireguard/${WireGuard_Interface}.conf"
+# ===== Interface mapping (D) =====
+WG_IFACE_V4="wgcf4"
+WG_IFACE_V6="wgcf6"
+WG_IFACE_DUAL="wgcfd"
+WG_IFACE_NG="wgcfng"
+ALL_WG_INTERFACES=("${WG_IFACE_V4}" "${WG_IFACE_V6}" "${WG_IFACE_DUAL}" "${WG_IFACE_NG}")
+
+# Active interface (will be set by mode)
+WireGuard_Interface=''
+WireGuard_ConfPath=''
 
 WireGuard_Interface_DNS_IPv4='1.1.1.1,1.0.0.1'
 WireGuard_Interface_DNS_IPv6='2606:4700:4700::1111,2606:4700:4700::1001'
 WireGuard_Interface_DNS_46="${WireGuard_Interface_DNS_IPv4},${WireGuard_Interface_DNS_IPv6}"
-WireGuard_Interface_DNS_64="${WireGuard_Interface_DNS_IPv6},${WireGuard_Interface_DNS_IPv4}"
+
 WireGuard_Interface_Rule_table='51888'
 WireGuard_Interface_Rule_fwmark='51888'
 WireGuard_Interface_MTU='1280'
@@ -87,7 +99,7 @@ ensure_wireguard_dir() {
     chmod 700 /etc/wireguard
 }
 
-# FIXED: do not force contrib/wg-quick (some snapshots do not have it)
+# Debian10/old repo fallback build wg + wg-quick
 install_wireguard_tools_from_source_debian10() {
     log INFO "Debian10/old repo: building wireguard-tools (wg + wg-quick) from source..."
 
@@ -106,10 +118,8 @@ install_wireguard_tools_from_source_debian10() {
     tar -xf wireguard-tools.tar.xz || return 1
     cd wireguard-tools-* || return 1
 
-    # Most snapshots install wg + wg-quick from src install
     make -C src -j"$(nproc)" && make -C src install || return 1
 
-    # Optional fallback if wg-quick still missing
     if ! command -v wg-quick >/dev/null 2>&1; then
         if [[ -d contrib/wg-quick ]]; then
             make -C contrib/wg-quick -j"$(nproc)" && make -C contrib/wg-quick install || return 1
@@ -122,7 +132,6 @@ install_wireguard_tools_from_source_debian10() {
     fi
 
     systemctl daemon-reload >/dev/null 2>&1 || true
-
     command -v wg >/dev/null 2>&1 && command -v wg-quick >/dev/null 2>&1
 }
 
@@ -306,7 +315,6 @@ Disconnect_WARP() {
     warp-cli --accept-tos mode warp >/dev/null 2>&1 || warp-cli --accept-tos set-mode warp >/dev/null 2>&1 || true
 }
 
-# NEW proxy mode + port + fallback old
 Set_WARP_Mode_Proxy() {
     log INFO "Setting up WARP Proxy Mode..."
     warp-cli --accept-tos mode proxy >/dev/null 2>&1 || warp-cli --accept-tos set-mode proxy
@@ -366,12 +374,20 @@ Backup_WGCF_Profile() {
     mv -f wgcf* ${WGCF_ProfileDir} 2>/dev/null || true
 }
 
+# ===== A) Read WGCF profile with CIDR split =====
 Read_WGCF_Profile() {
     WireGuard_Interface_PrivateKey=$(grep ^PrivateKey "${WGCF_ProfilePath}" | cut -d= -f2- | awk '$1=$1')
-    WireGuard_Interface_Address=$(grep ^Address "${WGCF_ProfilePath}" | cut -d= -f2- | awk '$1=$1' | sed ":a;N;s/\n/,/g;ta")
     WireGuard_Peer_PublicKey=$(grep ^PublicKey "${WGCF_ProfilePath}" | cut -d= -f2- | awk '$1=$1')
-    WireGuard_Interface_Address_IPv4=$(echo ${WireGuard_Interface_Address} | cut -d, -f1 | cut -d'/' -f1)
-    WireGuard_Interface_Address_IPv6=$(echo ${WireGuard_Interface_Address} | cut -d, -f2 | cut -d'/' -f1)
+
+    local addr_line
+    addr_line=$(grep ^Address "${WGCF_ProfilePath}" | cut -d= -f2- | awk '$1=$1' | tr -d ' ')
+    WireGuard_Interface_Address_IPv4_CIDR=$(echo "$addr_line" | cut -d, -f1)
+    WireGuard_Interface_Address_IPv6_CIDR=$(echo "$addr_line" | cut -d, -f2)
+
+    WireGuard_Interface_Address_IPv4=$(echo "${WireGuard_Interface_Address_IPv4_CIDR}" | cut -d'/' -f1)
+    WireGuard_Interface_Address_IPv6=$(echo "${WireGuard_Interface_Address_IPv6_CIDR}" | cut -d'/' -f1)
+
+    WireGuard_Interface_Address_46="${WireGuard_Interface_Address_IPv4_CIDR},${WireGuard_Interface_Address_IPv6_CIDR}"
 }
 
 Load_WGCF_Profile() {
@@ -394,7 +410,7 @@ Install_WireGuardTools_Debian() {
     if apt-cache show wireguard-tools >/dev/null 2>&1; then
         apt install -y wireguard-tools --no-install-recommends
     else
-        log WARN "wireguard-tools not found in apt (common on Debian 10 archive). Fallback to source build..."
+        log WARN "wireguard-tools not found in apt. Fallback to source build..."
         install_wireguard_tools_from_source_debian10 || {
             log ERROR "Failed to build/install wireguard-tools from source."
             exit 1
@@ -463,19 +479,55 @@ Install_WireGuardGo() {
     esac
 }
 
+# ===== D) Mode -> Interface selector =====
+Set_Mode_Interface() {
+    local mode="$1"
+    case "$mode" in
+        v4)   WireGuard_Interface="${WG_IFACE_V4}" ;;
+        v6)   WireGuard_Interface="${WG_IFACE_V6}" ;;
+        dual) WireGuard_Interface="${WG_IFACE_DUAL}" ;;
+        ng)   WireGuard_Interface="${WG_IFACE_NG}" ;;
+        *)
+            log ERROR "Unknown mode: $mode"
+            exit 1
+            ;;
+    esac
+    WireGuard_ConfPath="/etc/wireguard/${WireGuard_Interface}.conf"
+}
+
+Disable_WireGuard_All() {
+    Check_WARP_Client
+    for iface in "${ALL_WG_INTERFACES[@]}"; do
+        systemctl disable "wg-quick@${iface}" --now >/dev/null 2>&1 || true
+    done
+    if [[ ${WARP_Client_Status} = active ]]; then
+        systemctl start warp-svc >/dev/null 2>&1 || true
+    fi
+}
+
+Disable_Other_WG_Units() {
+    local keep="$1"
+    Check_WARP_Client
+    for iface in "${ALL_WG_INTERFACES[@]}"; do
+        [[ "$iface" == "$keep" ]] && continue
+        systemctl disable "wg-quick@${iface}" --now >/dev/null 2>&1 || true
+    done
+}
+
 Check_WireGuard() {
-    WireGuard_Status=$(systemctl is-active wg-quick@${WireGuard_Interface} 2>/dev/null)
-    WireGuard_SelfStart=$(systemctl is-enabled wg-quick@${WireGuard_Interface} 2>/dev/null)
+    # check current interface
+    WireGuard_Status=$(systemctl is-active "wg-quick@${WireGuard_Interface}" 2>/dev/null)
+    WireGuard_SelfStart=$(systemctl is-enabled "wg-quick@${WireGuard_Interface}" 2>/dev/null)
 }
 
 Install_WireGuard() {
     Print_System_Info
-    Check_WireGuard
-    if [[ ${WireGuard_SelfStart} != enabled || ${WireGuard_Status} != active ]]; then
+    # Don't rely on unit status for install; just ensure tools exist
+    if ! command -v wg >/dev/null 2>&1 || ! command -v wg-quick >/dev/null 2>&1; then
         Install_WireGuardTools
         Install_WireGuardGo
     else
-        log INFO "WireGuard is installed and running."
+        log INFO "WireGuard tools already installed."
     fi
 }
 
@@ -485,50 +537,57 @@ Start_WireGuard() {
         exit 1
     }
 
+    # D) Disable other WG units so reboot stays in last mode
+    Disable_Other_WG_Units "${WireGuard_Interface}"
+
     Check_WARP_Client
-    log INFO "Starting WireGuard..."
+    log INFO "Starting WireGuard (${WireGuard_Interface})..."
     if [[ ${WARP_Client_Status} = active ]]; then
-        systemctl stop warp-svc
-        systemctl enable wg-quick@${WireGuard_Interface} --now
-        systemctl start warp-svc
+        systemctl stop warp-svc >/dev/null 2>&1 || true
+        systemctl enable "wg-quick@${WireGuard_Interface}" --now
+        systemctl start warp-svc >/dev/null 2>&1 || true
     else
-        systemctl enable wg-quick@${WireGuard_Interface} --now
+        systemctl enable "wg-quick@${WireGuard_Interface}" --now
     fi
+
     Check_WireGuard
     if [[ ${WireGuard_Status} = active ]]; then
         log INFO "WireGuard is running."
     else
         log ERROR "WireGuard failure to run!"
-        journalctl -u wg-quick@${WireGuard_Interface} --no-pager
+        journalctl -u "wg-quick@${WireGuard_Interface}" --no-pager
         exit 1
     fi
 }
 
 Restart_WireGuard() {
+    Disable_Other_WG_Units "${WireGuard_Interface}"
+
     Check_WARP_Client
-    log INFO "Restarting WireGuard..."
+    log INFO "Restarting WireGuard (${WireGuard_Interface})..."
     if [[ ${WARP_Client_Status} = active ]]; then
-        systemctl stop warp-svc
-        systemctl restart wg-quick@${WireGuard_Interface}
-        systemctl start warp-svc
+        systemctl stop warp-svc >/dev/null 2>&1 || true
+        systemctl restart "wg-quick@${WireGuard_Interface}"
+        systemctl start warp-svc >/dev/null 2>&1 || true
     else
-        systemctl restart wg-quick@${WireGuard_Interface}
+        systemctl restart "wg-quick@${WireGuard_Interface}"
     fi
+
     Check_WireGuard
     if [[ ${WireGuard_Status} = active ]]; then
         log INFO "WireGuard has been restarted."
     else
         log ERROR "WireGuard failure to run!"
-        journalctl -u wg-quick@${WireGuard_Interface} --no-pager
+        journalctl -u "wg-quick@${WireGuard_Interface}" --no-pager
         exit 1
     fi
 }
 
 Enable_IPv6_Support() {
-    if [[ $(sysctl -a | grep 'disable_ipv6.*=.*1') || $(cat /etc/sysctl.{conf,d/*} 2>/dev/null | grep 'disable_ipv6.*=.*1') ]]; then
+    if [[ $(sysctl -a 2>/dev/null | grep 'disable_ipv6.*=.*1') || $(cat /etc/sysctl.{conf,d/*} 2>/dev/null | grep 'disable_ipv6.*=.*1') ]]; then
         sed -i '/disable_ipv6/d' /etc/sysctl.{conf,d/*} 2>/dev/null
         echo 'net.ipv6.conf.all.disable_ipv6 = 0' >/etc/sysctl.d/ipv6.conf
-        sysctl -w net.ipv6.conf.all.disable_ipv6=0
+        sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1 || true
     fi
 }
 
@@ -546,13 +605,13 @@ Disable_WireGuard() {
     Check_WARP_Client
     Check_WireGuard
     if [[ ${WireGuard_SelfStart} = enabled || ${WireGuard_Status} = active ]]; then
-        log INFO "Disabling WireGuard..."
+        log INFO "Disabling WireGuard (${WireGuard_Interface})..."
         if [[ ${WARP_Client_Status} = active ]]; then
-            systemctl stop warp-svc
-            systemctl disable wg-quick@${WireGuard_Interface} --now
-            systemctl start warp-svc
+            systemctl stop warp-svc >/dev/null 2>&1 || true
+            systemctl disable "wg-quick@${WireGuard_Interface}" --now
+            systemctl start warp-svc >/dev/null 2>&1 || true
         else
-            systemctl disable wg-quick@${WireGuard_Interface} --now
+            systemctl disable "wg-quick@${WireGuard_Interface}" --now
         fi
         Check_WireGuard
         if [[ ${WireGuard_SelfStart} != enabled && ${WireGuard_Status} != active ]]; then
@@ -582,7 +641,9 @@ Check_Network_Status_IPv6() {
 }
 
 Check_Network_Status() {
-    Disable_WireGuard
+    # Original behavior disables WG before checking.
+    # With multi-iface (D), disable all.
+    Disable_WireGuard_All
     Check_Network_Status_IPv4
     Check_Network_Status_IPv6
 }
@@ -646,61 +707,69 @@ Get_WireGuard_Interface_MTU() {
     log INFO "WireGuard MTU: ${WireGuard_Interface_MTU}"
 }
 
+# ===== A) Interface writer now takes Address + DNS =====
 Generate_WireGuardProfile_Interface() {
+    local ADDR="$1"
+    local DNS="$2"
+
     ensure_wireguard_dir
     Get_WireGuard_Interface_MTU
     log INFO "WireGuard profile (${WireGuard_ConfPath}) generation in progress..."
-    cat <<EOF >${WireGuard_ConfPath}
+    cat <<EOF >"${WireGuard_ConfPath}"
 
 [Interface]
 PrivateKey = ${WireGuard_Interface_PrivateKey}
-Address = ${WireGuard_Interface_Address}
-DNS = ${WireGuard_Interface_DNS}
+Address = ${ADDR}
+DNS = ${DNS}
 MTU = ${WireGuard_Interface_MTU}
 EOF
 }
 
+# ===== B) Idempotent ip rules (PreUp del, PostDown del) =====
 Generate_WireGuardProfile_Interface_Rule_IPv4_Global_srcIP() {
-    cat <<EOF >>${WireGuard_ConfPath}
-PostUp = ip -4 rule add from ${IPv4_addr} lookup main prio 18
-PostDown = ip -4 rule delete from ${IPv4_addr} lookup main prio 18
+cat <<EOF >>"${WireGuard_ConfPath}"
+PreUp = ip -4 rule del from ${IPv4_addr} lookup main prio 18 2>/dev/null || true
+PostUp = ip -4 rule add from ${IPv4_addr} lookup main prio 18 2>/dev/null || true
+PostDown = ip -4 rule del from ${IPv4_addr} lookup main prio 18 2>/dev/null || true
 EOF
 }
 
 Generate_WireGuardProfile_Interface_Rule_IPv6_Global_srcIP() {
-    cat <<EOF >>${WireGuard_ConfPath}
-PostUp = ip -6 rule add from ${IPv6_addr} lookup main prio 18
-PostDown = ip -6 rule delete from ${IPv6_addr} lookup main prio 18
+cat <<EOF >>"${WireGuard_ConfPath}"
+PreUp = ip -6 rule del from ${IPv6_addr} lookup main prio 18 2>/dev/null || true
+PostUp = ip -6 rule add from ${IPv6_addr} lookup main prio 18 2>/dev/null || true
+PostDown = ip -6 rule del from ${IPv6_addr} lookup main prio 18 2>/dev/null || true
 EOF
 }
 
 Generate_WireGuardProfile_Interface_Rule_TableOff() {
-    cat <<EOF >>${WireGuard_ConfPath}
+cat <<EOF >>"${WireGuard_ConfPath}"
 Table = off
 EOF
 }
 
+# ===== C) non-global: PostUp correct + route replace + idempotent adds =====
 Generate_WireGuardProfile_Interface_Rule_IPv4_nonGlobal() {
-    cat <<EOF >>${WireGuard_ConfPath}
-PostUP = ip -4 route add default dev ${WireGuard_Interface} table ${WireGuard_Interface_Rule_table}
-PostUP = ip -4 rule add from ${WireGuard_Interface_Address_IPv4} lookup ${WireGuard_Interface_Rule_table}
-PostDown = ip -4 rule delete from ${WireGuard_Interface_Address_IPv4} lookup ${WireGuard_Interface_Rule_table}
-PostUP = ip -4 rule add fwmark ${WireGuard_Interface_Rule_fwmark} lookup ${WireGuard_Interface_Rule_table}
-PostDown = ip -4 rule delete fwmark ${WireGuard_Interface_Rule_fwmark} lookup ${WireGuard_Interface_Rule_table}
-PostUP = ip -4 rule add table main suppress_prefixlength 0
-PostDown = ip -4 rule delete table main suppress_prefixlength 0
+cat <<EOF >>"${WireGuard_ConfPath}"
+PostUp = ip -4 route replace default dev ${WireGuard_Interface} table ${WireGuard_Interface_Rule_table}
+PostUp = ip -4 rule add from ${WireGuard_Interface_Address_IPv4} lookup ${WireGuard_Interface_Rule_table} 2>/dev/null || true
+PostDown = ip -4 rule del from ${WireGuard_Interface_Address_IPv4} lookup ${WireGuard_Interface_Rule_table} 2>/dev/null || true
+PostUp = ip -4 rule add fwmark ${WireGuard_Interface_Rule_fwmark} lookup ${WireGuard_Interface_Rule_table} 2>/dev/null || true
+PostDown = ip -4 rule del fwmark ${WireGuard_Interface_Rule_fwmark} lookup ${WireGuard_Interface_Rule_table} 2>/dev/null || true
+PostUp = ip -4 rule add table main suppress_prefixlength 0 2>/dev/null || true
+PostDown = ip -4 rule del table main suppress_prefixlength 0 2>/dev/null || true
 EOF
 }
 
 Generate_WireGuardProfile_Interface_Rule_IPv6_nonGlobal() {
-    cat <<EOF >>${WireGuard_ConfPath}
-PostUP = ip -6 route add default dev ${WireGuard_Interface} table ${WireGuard_Interface_Rule_table}
-PostUP = ip -6 rule add from ${WireGuard_Interface_Address_IPv6} lookup ${WireGuard_Interface_Rule_table}
-PostDown = ip -6 rule delete from ${WireGuard_Interface_Address_IPv6} lookup ${WireGuard_Interface_Rule_table}
-PostUP = ip -6 rule add fwmark ${WireGuard_Interface_Rule_fwmark} lookup ${WireGuard_Interface_Rule_table}
-PostDown = ip -6 rule delete fwmark ${WireGuard_Interface_Rule_fwmark} lookup ${WireGuard_Interface_Rule_table}
-PostUP = ip -6 rule add table main suppress_prefixlength 0
-PostDown = ip -6 rule delete table main suppress_prefixlength 0
+cat <<EOF >>"${WireGuard_ConfPath}"
+PostUp = ip -6 route replace default dev ${WireGuard_Interface} table ${WireGuard_Interface_Rule_table}
+PostUp = ip -6 rule add from ${WireGuard_Interface_Address_IPv6} lookup ${WireGuard_Interface_Rule_table} 2>/dev/null || true
+PostDown = ip -6 rule del from ${WireGuard_Interface_Address_IPv6} lookup ${WireGuard_Interface_Rule_table} 2>/dev/null || true
+PostUp = ip -6 rule add fwmark ${WireGuard_Interface_Rule_fwmark} lookup ${WireGuard_Interface_Rule_table} 2>/dev/null || true
+PostDown = ip -6 rule del fwmark ${WireGuard_Interface_Rule_fwmark} lookup ${WireGuard_Interface_Rule_table} 2>/dev/null || true
+PostUp = ip -6 rule add table main suppress_prefixlength 0 2>/dev/null || true
+PostDown = ip -6 rule del table main suppress_prefixlength 0 2>/dev/null || true
 EOF
 }
 
@@ -711,7 +780,7 @@ Generate_WireGuardProfile_Interface_Rule_DualStack_nonGlobal() {
 }
 
 Generate_WireGuardProfile_Peer() {
-    cat <<EOF >>${WireGuard_ConfPath}
+cat <<EOF >>"${WireGuard_ConfPath}"
 
 [Peer]
 PublicKey = ${WireGuard_Peer_PublicKey}
@@ -755,11 +824,15 @@ Check_WARP_Proxy_Status() {
 }
 
 Check_WireGuard_Status() {
-    Check_WireGuard
-    case ${WireGuard_Status} in
-    active) WireGuard_Status_en="${FontColor_Green}Running${FontColor_Suffix}" ;;
-    *)      WireGuard_Status_en="${FontColor_Red}Stopped${FontColor_Suffix}" ;;
-    esac
+    if [[ -n "${WireGuard_Interface}" ]]; then
+        Check_WireGuard
+        case ${WireGuard_Status} in
+        active) WireGuard_Status_en="${FontColor_Green}Running(${WireGuard_Interface})${FontColor_Suffix}" ;;
+        *)      WireGuard_Status_en="${FontColor_Red}Stopped${FontColor_Suffix}" ;;
+        esac
+    else
+        WireGuard_Status_en="${FontColor_Red}Stopped${FontColor_Suffix}"
+    fi
 }
 
 Check_WARP_WireGuard_Status() {
@@ -791,7 +864,7 @@ Check_WARP_WireGuard_Status() {
 
     if [[ ${IPv4Status} = off && ${IPv6Status} = off ]]; then
         log ERROR "Cloudflare WARP network anomaly, WireGuard tunnel established failed."
-        Disable_WireGuard
+        Disable_WireGuard_All
         exit 1
     fi
 }
@@ -799,7 +872,14 @@ Check_WARP_WireGuard_Status() {
 Check_ALL_Status() {
     Check_WARP_Client_Status
     Check_WARP_Proxy_Status
-    Check_WireGuard_Status
+    # show any active wg-quick unit among our list
+    WireGuard_Status_en="${FontColor_Red}Stopped${FontColor_Suffix}"
+    for iface in "${ALL_WG_INTERFACES[@]}"; do
+        if systemctl is-active "wg-quick@${iface}" >/dev/null 2>&1; then
+            WireGuard_Status_en="${FontColor_Green}Running(${iface})${FontColor_Suffix}"
+            break
+        fi
+    done
     Check_WARP_WireGuard_Status
 }
 
@@ -848,26 +928,23 @@ Print_ALL_Status() {
 
 View_WireGuard_Profile() {
     Print_Delimiter
-    cat ${WireGuard_ConfPath}
+    cat "${WireGuard_ConfPath}"
     Print_Delimiter
 }
 
 # ===== MAIN CONFIG =====
+# A) Per-mode Address/DNS strict
 Set_WARP_IPv4() {
+    Set_Mode_Interface v4
     Install_WireGuard
     Get_IP_addr
     Load_WGCF_Profile
 
-    if [[ ${IPv4Status} = off && ${IPv6Status} = on ]]; then
-        WireGuard_Interface_DNS="${WireGuard_Interface_DNS_64}"
-    else
-        WireGuard_Interface_DNS="${WireGuard_Interface_DNS_46}"
-    fi
-
     WireGuard_Peer_AllowedIPs="${WireGuard_Peer_AllowedIPs_IPv4}"
+    WireGuard_Interface_DNS="${WireGuard_Interface_DNS_IPv4}"
     Check_WireGuard_Peer_Endpoint
 
-    Generate_WireGuardProfile_Interface
+    Generate_WireGuardProfile_Interface "${WireGuard_Interface_Address_IPv4_CIDR}" "${WireGuard_Interface_DNS}"
     if [[ -n ${IPv4_addr} ]]; then
         Generate_WireGuardProfile_Interface_Rule_IPv4_Global_srcIP
     fi
@@ -879,20 +956,16 @@ Set_WARP_IPv4() {
 }
 
 Set_WARP_IPv6() {
+    Set_Mode_Interface v6
     Install_WireGuard
     Get_IP_addr
     Load_WGCF_Profile
 
-    if [[ ${IPv4Status} = off && ${IPv6Status} = on ]]; then
-        WireGuard_Interface_DNS="${WireGuard_Interface_DNS_64}"
-    else
-        WireGuard_Interface_DNS="${WireGuard_Interface_DNS_46}"
-    fi
-
     WireGuard_Peer_AllowedIPs="${WireGuard_Peer_AllowedIPs_IPv6}"
+    WireGuard_Interface_DNS="${WireGuard_Interface_DNS_IPv6}"
     Check_WireGuard_Peer_Endpoint
 
-    Generate_WireGuardProfile_Interface
+    Generate_WireGuardProfile_Interface "${WireGuard_Interface_Address_IPv6_CIDR}" "${WireGuard_Interface_DNS}"
     if [[ -n ${IPv6_addr} ]]; then
         Generate_WireGuardProfile_Interface_Rule_IPv6_Global_srcIP
     fi
@@ -904,6 +977,7 @@ Set_WARP_IPv6() {
 }
 
 Set_WARP_DualStack() {
+    Set_Mode_Interface dual
     Install_WireGuard
     Get_IP_addr
     Load_WGCF_Profile
@@ -912,7 +986,7 @@ Set_WARP_DualStack() {
     WireGuard_Peer_AllowedIPs="${WireGuard_Peer_AllowedIPs_DualStack}"
     Check_WireGuard_Peer_Endpoint
 
-    Generate_WireGuardProfile_Interface
+    Generate_WireGuardProfile_Interface "${WireGuard_Interface_Address_46}" "${WireGuard_Interface_DNS}"
     if [[ -n ${IPv4_addr} ]]; then
         Generate_WireGuardProfile_Interface_Rule_IPv4_Global_srcIP
     fi
@@ -927,6 +1001,7 @@ Set_WARP_DualStack() {
 }
 
 Set_WARP_DualStack_nonGlobal() {
+    Set_Mode_Interface ng
     Install_WireGuard
     Get_IP_addr
     Load_WGCF_Profile
@@ -935,7 +1010,7 @@ Set_WARP_DualStack_nonGlobal() {
     WireGuard_Peer_AllowedIPs="${WireGuard_Peer_AllowedIPs_DualStack}"
     Check_WireGuard_Peer_Endpoint
 
-    Generate_WireGuardProfile_Interface
+    Generate_WireGuardProfile_Interface "${WireGuard_Interface_Address_46}" "${WireGuard_Interface_DNS}"
     Generate_WireGuardProfile_Interface_Rule_DualStack_nonGlobal
     Generate_WireGuardProfile_Peer
 
@@ -957,17 +1032,32 @@ SUBCOMMANDS:
     restart         Restart Cloudflare WARP Official Linux Client
     proxy           Enable WARP Client Proxy Mode (SOCKS5 port: 40000)
     unproxy         Disable WARP Client Proxy Mode
-    wg              Install WireGuard and related components
-    wg4             Configure WARP WireGuard IPv4 (Global)
-    wg6             Configure WARP WireGuard IPv6 (Global)
-    wgd             Configure WARP WireGuard Dual Stack (Global)
-    wgx             Configure WARP WireGuard Non-Global
-    rwg             Restart WireGuard service
-    dwg             Disable WireGuard service
+    wg              Install WireGuard and related components (tools)
+    wg4             Configure WARP WireGuard IPv4 ONLY (Global)  -> iface ${WG_IFACE_V4}
+    wg6             Configure WARP WireGuard IPv6 ONLY (Global)  -> iface ${WG_IFACE_V6}
+    wgd             Configure WARP WireGuard Dual Stack (Global) -> iface ${WG_IFACE_DUAL}
+    wgx             Configure WARP WireGuard Non-Global (Dual)   -> iface ${WG_IFACE_NG}
+    rwg             Restart WireGuard service (auto detect active iface)
+    dwg             Disable ALL WARP WireGuard services
     status          Show status
     version         Show script version
     help            Show this help
 "
+}
+
+Restart_WireGuard_Auto() {
+    # restart whichever is active; if none active, restart last-known (default dual)
+    local active=""
+    for iface in "${ALL_WG_INTERFACES[@]}"; do
+        if systemctl is-active "wg-quick@${iface}" >/dev/null 2>&1; then
+            active="$iface"
+            break
+        fi
+    done
+    [[ -z "$active" ]] && active="${WG_IFACE_DUAL}"
+    WireGuard_Interface="$active"
+    WireGuard_ConfPath="/etc/wireguard/${WireGuard_Interface}.conf"
+    Restart_WireGuard
 }
 
 # ===== ENTRY =====
@@ -984,12 +1074,16 @@ if [ $# -ge 1 ]; then
     wg6|6) Set_WARP_IPv6 ;;
     wgd|d) Set_WARP_DualStack ;;
     wgx|x) Set_WARP_DualStack_nonGlobal ;;
-    rwg)   Restart_WireGuard ;;
-    dwg)   Disable_WireGuard ;;
+    rwg)   Restart_WireGuard_Auto ;;
+    dwg)   Disable_WireGuard_All ;;
     status) Print_ALL_Status ;;
     help)  Print_Usage ;;
     version) echo "${shVersion}" ;;
-    *) log ERROR "Invalid Parameters: $*"; Print_Usage; exit 1 ;;
+    *)
+        log ERROR "Invalid Parameters: $*"
+        Print_Usage
+        exit 1
+        ;;
     esac
 else
     Print_Usage
