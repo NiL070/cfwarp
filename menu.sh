@@ -509,7 +509,7 @@ while true; do
   box_line "Date   : ${WHT}${DATE_NOW}${RST}"
   box_mid
 
-  box_line "${ACC4}${BOLD}LIVE STATUS${RST}  ${DIM}(cached ${CACHE_TTL}s)${RST}"
+  box_line "${ACC4}${BOLD}STATUS :${RST}"
   while IFS='|' read -r k v; do
     box_line "  ${ACC3}${k}${RST} : $(status_badge "$v")"
   done < <(get_live_status_compact)
