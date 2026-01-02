@@ -500,11 +500,13 @@ while true; do
   box_top "CLOUDFLARE WARP CONTROL PANEL (Simple Menu By NiLphreakz)"
   box_mid
 
-  box_line "${ACC5}${BOLD}SERVER${RST}  OS: ${WHT}${OSNAME}${RST}"
-  box_line "Kernel: ${WHT}${KERNEL}${RST}"
-  box_line "Uptime: ${WHT}${uptime_str}${RST}"
-  box_line "RAM  : ${WHT}${uram}MB${RST}/${WHT}${tram}MB${RST}   IPv4: ${WHT}${IPVPS}${RST}"
-  box_line "Date : ${WHT}${DATE_NOW}${RST}"
+  box_line "${ACC5}${BOLD}SERVER${RST}"
+  box_line "OS     : ${WHT}${OSNAME}${RST}"
+  box_line "Kernel : ${WHT}${KERNEL}${RST}"
+  box_line "Uptime : ${WHT}${uptime_str}${RST}"
+  box_line "RAM    : ${WHT}${uram}MB${RST}/${WHT}${tram}MB${RST}"
+  box_line "IPv4   : ${WHT}${IPVPS}${RST}"
+  box_line "Date   : ${WHT}${DATE_NOW}${RST}"
   box_mid
 
   box_line "${ACC4}${BOLD}LIVE STATUS${RST}  ${DIM}(cached ${CACHE_TTL}s)${RST}"
